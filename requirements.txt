@@ -5,6 +5,7 @@ scipy
 pandas
 torch
 tqdm
+PyYAML
 
 #Rl specific
 gymnasium
