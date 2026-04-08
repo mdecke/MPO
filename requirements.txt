@@ -1,0 +1,12 @@
+#General libraries
+numpy
+matplotlib
+scipy
+pandas
+torch
+tqdm
+
+#Rl specific
+gymnasium
+torchvision
+tensorboard
