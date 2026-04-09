@@ -1,5 +1,6 @@
 import os
 from typing import List, Dict, Tuple, Optional
+from tqdm import tqdm
 import argparse
 
 import numpy as np
@@ -15,8 +16,11 @@ import torch.distributions as dist
 
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
-parser.add_argument("--")
+parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
+parser.add_argument('--env_interactions', type=int, default=1_000_000, help="number of total steps across envs")
+args = parser.parse_args()
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Buffer:
     def __init__(self,
@@ -31,6 +35,7 @@ class Buffer:
         self.envs = n_envs
         self.obs_dim = observation_dim
         self.act_dim = action_dim
+        self.buffer_cfg = cfg
 
         #Set up correct shape for arrays
         if isinstance(self.obs_dim, int):
@@ -112,7 +117,49 @@ class Buffer:
 
 
 def main():
-    pass
+    env = gym.make(args.task)
+    obs_dim = env.observation_space.shape
+    act_dim = env.action_space.shape
+    data_buffer = Buffer(buffer_sz=100000,
+                         n_envs=args.n_envs,
+                         observation_dim=obs_dim,
+                         action_dim=act_dim,
+                         cfg=None) #TODO: buffer only needs buffer cfg, not explicit
+
+    training_steps_per_env = np.ceil(args.env_interactions/args.n_envs).astype(int)
+    progress_bar = tqdm(range(training_steps_per_env), unit="step")
+    
+    obs, _ = env.reset()
+
+    td_horizon = 4
+    cumulative_reward = 0.0
+    episode_lengths = 0
+    for step in progress_bar:
+        with torch.no_grad():
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            action = env.action_space.sample()
+            action_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
+
+            next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
+            reward_tensor = torch.as_tensor(reward, dtype=torch.float32, device=device).view(args.n_envs, -1)
+            terminated_tensor = torch.as_tensor(terminated, dtype=torch.bool, device=device).view(args.n_envs, -1)
+            truncated_tensor = torch.as_tensor(truncated, dtype=torch.bool, device=device).view(args.n_envs, -1)
+            cumulative_reward += reward_tensor
+            episode_lengths += 1
+
+            data_buffer.add_sample(obs_t, action_t, next_obs_tensor, reward_tensor, truncated_tensor, terminated_tensor)
+
+            obs = next_obs
+
+            if step > td_horizon:
+                print(data_buffer.sample(td_horizon))
+
+            if terminated or truncated:
+                episode_lengths = 0
+
+    env.close()
+        
     
 
 
