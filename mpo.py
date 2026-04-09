@@ -127,6 +127,7 @@ class Buffer:
 
         return batch
 
+#Policy is stochastic following Normal dist --> N(mu, sigma), with mu and sigma outputs of a MLP.
 class Actor(nn.Module):
     def __init__(self,
                  input_dim:int,
@@ -153,13 +154,23 @@ class Actor(nn.Module):
         
         self.net = nn.Sequential(*layers)
         
-        if self.stochastic:
-            self.mu_head = nn.Linear(prev_dim, self.output_dim)
-            self.log_sigma_head = nn.Linear(prev_dim, self.output_dim)
-        else:
-            self.out = nn.Linear(prev_dim, self.output_dim)
+        self.mu_head = nn.Linear(prev_dim, self.output_dim)
+        self.log_sigma_head = nn.Linear(prev_dim, self.output_dim)
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
+
+    def forward(self, input:torch.Tensor) -> torch.Tensor:
+        logits = self.net(input)
+        mu = self.mu_head(logits)
+        log_sigma = self.log_sigma_head(logits)
+        if self.training:
+            sigma = torch.exp(log_sigma) + 1e-6 #ensure std is non zero
+            actions = torch.normal(mu, sigma)
+        else:
+            actions = mu
+        bounded_actions = torch.tanh(actions) * self.action_limit
+        return bounded_actions
+
 
 
 def main():
