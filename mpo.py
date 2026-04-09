@@ -171,6 +171,37 @@ class Actor(nn.Module):
         bounded_actions = torch.tanh(actions) * self.action_limit
         return bounded_actions
 
+class Critic(nn.Module):
+    def __init__(self,
+                 input_dim:int,
+                 hidden_dims:List[int],
+                 lr:float,
+                 actv_fct:str,
+                 output_dim:int=1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.lr = lr
+
+        layers = []
+        prev_dim = self.input_dim
+
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(get_activation(actv_fct))
+            prev_dim = hidden_dim
+        
+        layers.append(nn.Linear(prev_dim, self.output_dim)) # Q(s,a): R_s x R_a --> R
+        self.net = nn.Sequential(*layers)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        
+    def forward(self, state:torch.Tensor, action:torch.Tensor) -> torch.Tensor:
+        model_input = torch.cat((state,action), dim=-1)
+        return self.net(model_input)
+
+
 
 
 def main():
