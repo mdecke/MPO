@@ -71,7 +71,6 @@ class Buffer:
         
         #circular indexing
         index = self.env_steps % self.N 
-
         self.obs[index].copy_(obs)
         self.actions[index].copy_(actions)
         self.rewards[index].copy_(rewards.view(self.envs, 1))
@@ -91,8 +90,8 @@ class Buffer:
         if self.filled_lines - n_step_horizon < 0 : 
             raise ValueError("not enough samples")
         
-        start_time = torch.randint(0, max_start, (batch_size,), device=self.device, generator=self.generator)
-        sampled_envs  = torch.randint(0, self.envs,  (batch_size,), device=self.device, generator=self.generator)
+        start_time = torch.randint(0, max_start, (batch_size,), device=self.device)
+        sampled_envs  = torch.randint(0, self.envs,  (batch_size,), device=self.device)
 
         offset= torch.arange(n_step_horizon, device=self.device) #-> [0,1,2,...,n_step_horizon]       
         time_window = (start_time[:, None] + offset[None, :]) % self.N  #-> tensor[[start_time[0], start_time[0]+1, start_time[0]+2,...],start_time[1]] wrapped around N
@@ -138,7 +137,7 @@ def main():
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
             action = env.action_space.sample()
-            action_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            action_t = torch.tensor(action, dtype=torch.float32, device=device)
             next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
 
             next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
