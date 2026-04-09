@@ -22,6 +22,20 @@ args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+ACTIVATION_FCTS = {
+    'relu' : nn.ReLU,
+    'elu' : nn.ELU,
+    'tanh' : nn.Tanh,
+}
+
+def get_activation(name:str='relu') -> nn.Module:
+    name_lower = str.lower(name)
+    act_fcts = ACTIVATION_FCTS.keys()
+    if name_lower not in act_fcts:
+        raise KeyError(f'{name_lower} is not a valid activation function')
+    act_f = ACTIVATION_FCTS[name_lower]
+    return act_f()
+
 class Buffer:
     def __init__(self,
                  buffer_sz:int, n_envs:int,
@@ -113,6 +127,39 @@ class Buffer:
 
         return batch
 
+class Actor(nn.Module):
+    def __init__(self,
+                 input_dim:int,
+                 output_dim:int,
+                 action_limit:float,
+                 hidden_dims:List[int],
+                 lr:float,
+                 activation_fct:str,
+                 seed:int=42):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.lr = lr
+        self.action_limit = action_limit
+
+        layers = []
+        prev_dim = self.input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(get_activation(activation_fct))
+            prev_dim = hidden_dim
+        
+        self.net = nn.Sequential(*layers)
+        
+        if self.stochastic:
+            self.mu_head = nn.Linear(prev_dim, self.output_dim)
+            self.log_sigma_head = nn.Linear(prev_dim, self.output_dim)
+        else:
+            self.out = nn.Linear(prev_dim, self.output_dim)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
 
 def main():
