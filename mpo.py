@@ -108,7 +108,9 @@ class Buffer:
         self.env_steps+=1
         self.filled_lines = min(self.env_steps,self.N)
 
-    def sample(self, batch_size:int, n_step_horizon:int=1):
+    def sample(self,
+               batch_size:int,
+               n_step_horizon:int=1)->Dict[str,torch.Tensor]:
         
         max_start = self.filled_lines - n_step_horizon
         
@@ -222,13 +224,18 @@ class MPO_Agent():
         self.act_lim = self.cfg.get('env',{}).get('lim', 1.0)
         self.n_envs = self.cfg.get('env',{}).get('n_envs')
 
+        self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
+        self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
+
         self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
         self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
         self.policy_actv_fct = self.cfg.get('agent',{}).get('policy',{}).get('act_fct', 'relu')
+        self.policy_gradient_clipping = self.cfg.get('agent',{}).get('policy',{}).get('gradient_clip', None)
         
         self.critic_layers = self.cfg.get('agent',{}).get('critic',{}).get('hidden_layers',[])
         self.critic_lr = self.cfg.get('agent',{}).get('critic',{}).get('lr', 0.001)
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
+        self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
 
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
@@ -277,11 +284,36 @@ class MPO_Agent():
             p.requires_grad = False
         for p in self.target_critic.parameters():
             p.requires_grad = False
+
+    def update_critic(self,
+                      batch_data:Dict[str,torch.Tensor]) -> None:
+        next_action = self.target_policy.forward(input=batch_data["next_obs"][:,-1,:])
+        q_target = self.target_critic.forward(state=batch_data['next_obs'][:,-1,:], action=next_action)
+
+        #temporal diff
+        y = q_target
+        for k in range(self.td_horizon-1,-1,-1):
+            termination = batch_data['term'][:,k,:]
+            reward =batch_data['r'][:,k,:]
+            y = reward + self.gamma * (~termination) * y
+        
+        q_value = self.critic.forward(state=batch_data['obs'][:,-1,:], action=batch_data['acts'][:,-1,:])
+        self.mean_q_value.append(q_value.mean().item())
+
+        critic_loss = F.mse_loss(q_value, y)
+        self.critic.optimizer.zero_grad()
+        critic_loss.backward()
+        
+        if self.critic_gradient_clipping:
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_gradient_clipping)
+        
+        self.critic.optimizer.step()
         
 
 
 
 def main():
+    
     env = gym.make(args.task)
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
@@ -293,6 +325,9 @@ def main():
 
     training_steps_per_env = np.ceil(args.env_interactions/args.n_envs).astype(int)
     progress_bar = tqdm(range(training_steps_per_env), unit="step")
+
+
+    agent = MPO_Agent()
     
     obs, _ = env.reset()
 
