@@ -1,4 +1,5 @@
 import os
+import copy
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 import argparse
@@ -35,6 +36,17 @@ def get_activation(name:str='relu') -> nn.Module:
         raise KeyError(f'{name_lower} is not a valid activation function')
     act_f = ACTIVATION_FCTS[name_lower]
     return act_f()
+
+def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1, seed:int=42) -> None:
+    if seed is not None:
+        torch.manual_seed(seed)
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "weight" in name:
+                nn.init.normal_(param, mean=mean, std=std)
+            elif "bias" in name:
+                nn.init.normal_(param, mean=mean, std=std)
+
 
 class Buffer:
     def __init__(self,
@@ -243,7 +255,29 @@ class MPO_Agent():
         print("[INFO]: Memory class initialized")
 
     def _init_models(self) -> None:
-        pass
+        self.policy = Actor(input_dim=self.obs_dim,
+                            output_dim=self.act_dim,
+                            action_limit=self.act_lim,  # Assuming symmetric action bounds
+                            hidden_dims=self.policy_layers,
+                            lr=self.policy_lr,
+                            activation_fct=self.policy_actv_fct)
+        self.critic = Critic(input_dim=self.obs_dim+self.act_dim,
+                             hidden_dims=self.critic_layers,
+                             lr=self.critic_lr,
+                             activation_fct=self.critic_actv_fct)
+        
+        init_model_weights(self.policy)
+        init_model_weights(self.critic)
+
+        self.target_policy = copy.deepcopy(self.policy)
+        self.target_critic = copy.deepcopy(self.critic)
+
+        #Targets only updated via polyak interpolation, no need to track grads
+        for p in self.target_policy.parameters():
+            p.requires_grad = False
+        for p in self.target_critic.parameters():
+            p.requires_grad = False
+        
 
 
 
