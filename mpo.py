@@ -200,7 +200,39 @@ class Critic(nn.Module):
     def forward(self, state:torch.Tensor, action:torch.Tensor) -> torch.Tensor:
         model_input = torch.cat((state,action), dim=-1)
         return self.net(model_input)
+    
+class MPO_Agent():
+    def __init__(self,cfg:Dict):
+        self.cfg = cfg
 
+        self.obs_dim = self.cfg.get('env',{}).get('obs_dim')
+        self.act_dim = self.cfg.get('env',{}).get('act_dim')
+        self.act_lim = self.cfg.get('env',{}).get('lim', 1.0)
+        self.n_envs = self.cfg.get('env',{}).get('n_envs')
+
+        self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
+        self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
+        self.policy_actv_fct = self.cfg.get('agent',{}).get('policy',{}).get('act_fct', 'relu')
+        
+        self.critic_layers = self.cfg.get('agent',{}).get('critic',{}).get('hidden_layers',[])
+        self.critic_lr = self.cfg.get('agent',{}).get('critic',{}).get('lr', 0.001)
+        self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
+
+        self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
+        self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
+        self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
+        self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
+
+        self.buffer_sz = self.cfg.get('memory', {}).get('buffer_sz', 1_000_000)
+        self.batch_sz = self.cfg.get('memory', {}).get('batch_sz', 256)
+        self.td_horizon = self.cfg.get('memory', {}).get('td_horizon', 1)
+
+        self._init_memory()
+        self._init_models()
+
+        self.critic_loss = []
+        self.policy_loss = []
+        self.mean_q_value = []
 
 
 
