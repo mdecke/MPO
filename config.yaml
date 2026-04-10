@@ -12,7 +12,7 @@ agent :
     lr : 0.0001
     act_fct : 'elu'
   
-memory :
+buffer :
   batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
   td_horizon : 1
