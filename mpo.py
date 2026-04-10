@@ -223,16 +223,27 @@ class MPO_Agent():
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
 
-        self.buffer_sz = self.cfg.get('memory', {}).get('buffer_sz', 1_000_000)
-        self.batch_sz = self.cfg.get('memory', {}).get('batch_sz', 256)
-        self.td_horizon = self.cfg.get('memory', {}).get('td_horizon', 1)
+        self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_sz', 1_000_000)
+        self.batch_sz = self.cfg.get('buffer', {}).get('batch_sz', 256)
+        self.td_horizon = self.cfg.get('buffer', {}).get('td_horizon', 1)
 
-        self._init_memory()
+        self._init_buffer()
         self._init_models()
 
         self.critic_loss = []
         self.policy_loss = []
         self.mean_q_value = []
+
+    def _init_buffer(self) -> None:
+        self.buffer = Buffer(self.buffer_sz,
+                             self.n_envs,
+                             self.obs_dim,
+                             self.act_dim
+                             )
+        print("[INFO]: Memory class initialized")
+
+    def _init_models(self) -> None:
+        pass
 
 
 
