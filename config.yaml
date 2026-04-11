@@ -6,12 +6,20 @@ agent :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'tanh'
+    gradient_clip : 5.0
+    update_delay : 10
   
   critic : 
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'elu'
+    gradient_clip : 5.0 
   
+  params:
+    gamma : 0.99
+    tau : 0.95
+    policy_samples : 100
+
 buffer :
   batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
