@@ -1,5 +1,6 @@
-seed : 42
-device : cpu
+general: 
+  seed : 42
+  device : cpu
 
 agent :
   policy :
@@ -19,7 +20,7 @@ agent :
     gamma : 0.99
     tau : 0.95
     policy_samples : 100
-    e_step_epsilon : None #TODO: what default value
+    e_step_epsilon : 1 #TODO: what default value
     n_temp_dual_steps : 200
 
 buffer :
@@ -28,7 +29,7 @@ buffer :
   td_horizon : 1
 
 training :
-  max_iterations : 10000
+  max_interactions : 10000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 1000
 
