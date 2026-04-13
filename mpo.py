@@ -236,6 +236,8 @@ class MPO_Agent():
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
         self.policy_samples = self.cfg.get('agent', {}).get('params',{}).get('policy_samples', 1)
+        self.e_step_epsilon = self.cfg.get('agent', {}).get('params',{}).get('e_step_epsilon', 1)
+        self.n_temp_dual_steps = self.cfg.get('agent', {}).get('params',{}).get('n_temp_dual_steps', 200)
 
         self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
         self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
@@ -321,14 +323,36 @@ class MPO_Agent():
         
         self.critic.optimizer.step()
 
+    def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_sz, n_samples = q_samples.shape
+        log_eta = torch.tensor(1.0, dtype=torch.float32, device=device, requires_grad=True)
+        dual_optimizer = optim.Adam([log_eta], lr=1e-2)
+
+        q_values = q_samples.detach()
+
+        for _ in range(n_dual_steps):
+            dual_optimizer.zero_grad()
+            eta = log_eta.exp()
+            dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(n_samples)).mean()
+            dual_loss.backward()
+            dual_optimizer.step()
+        
+        eta_star = log_eta.exp().detach()
+
+        weights = torch.softmax(q_values/eta_star, dim=-1)
+        return eta_star, weights
+
     def e_step(self,
-               batch_data: Dict[str, torch.Tensor]):
+               batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = batch_data['obs'][:,-1,:] #shape = (batch_sz, 1, obs_dim)
         for i,state in zip(range(self.batch_sz),obs):
             sampled_actions = self.target_policy.forward(state.unsqueeze(0),self.policy_samples).squeeze(0) #shape = (1, n_samples, act_dim) 
             for j in range(self.policy_samples):
                 self.evaluted_q[i,j] = self.critic.forward(state=state,action=sampled_actions[j,:])
-
+        
+        eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
+        
+        return sampled_actions, weights, eta
         
 
 
