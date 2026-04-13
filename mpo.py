@@ -72,19 +72,14 @@ def load_config(config_dict_path:str, args) -> Dict:
 
 class Buffer:
     def __init__(self,
-                 buffer_sz:int, n_envs:int,
-                 observation_dim:Tuple[int,...] | int,
-                 action_dim:Tuple[int,...] | int,
                  cfg:Optional[Dict],
-                 device:str="cpu",
                  action_dtype:torch.dtype=torch.float32):
+    
+        self.N = cfg['buffer_size']
+        self.envs = cfg['n_envs']
+        self.obs_dim = cfg['observation_dim']
+        self.act_dim = cfg['action_dim']
         
-        self.N = buffer_sz
-        self.envs = n_envs
-        self.obs_dim = observation_dim
-        self.act_dim = action_dim
-        self.buffer_cfg = cfg
-
         #Set up correct shape for arrays
         if isinstance(self.obs_dim, int):
             obs_shape = (self.obs_dim,)
@@ -95,7 +90,7 @@ class Buffer:
         else:
             act_shape = tuple(self.act_dim)
         
-        self.device = device
+        self.device = cfg['device']
 
         # Sequence of Arrays (SoA) --> each variable is stored in a (N by #_envs) tensor
         self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=device)
