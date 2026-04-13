@@ -19,7 +19,7 @@ import torch.distributions as dist
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
-parser.add_argument('--env_interactions', type=int, default=1_000_000, help="number of total steps across envs")
+parser.add_argument('--max_interactions', type=int, default=1_000, help="number of total steps across envs")
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -299,6 +299,18 @@ class MPO_Agent():
         for p in self.target_critic.parameters():
             p.requires_grad = False
 
+    def _train(self) -> None:
+        self.policy.train()
+        self.target_policy.train()
+        self.critic.train()
+        self.target_critic.train()
+    
+    def _eval(self) -> None:
+        self.policy.eval()
+        self.target_policy.eval()
+        self.critic.eval()
+        self.target_critic.eval()
+
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
         next_action = self.target_policy.forward(input=batch_data["next_obs"][:,-1,:])
@@ -358,22 +370,22 @@ class MPO_Agent():
 
 
 def main():
-    
+    cwd = os.getcwd()
+    config_path = os.path.join(cwd,'config.yaml')
+    cfg = load_config(config_path, args)
+
     env = gym.make(args.task)
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
-    data_buffer = Buffer(buffer_sz=100000,
-                         n_envs=args.n_envs,
-                         observation_dim=obs_dim,
-                         action_dim=act_dim,
-                         cfg=None) #TODO: buffer only needs buffer cfg, not explicit
+    data_buffer = Buffer(cfg=cfg) #TODO: buffer only needs buffer cfg, not explicit
 
     training_steps_per_env = np.ceil(args.env_interactions/args.n_envs).astype(int)
     progress_bar = tqdm(range(training_steps_per_env), unit="step")
 
 
     agent = MPO_Agent()
-    
+    agent._train()
+
     obs, _ = env.reset()
 
     td_horizon = 4
@@ -382,8 +394,7 @@ def main():
     for step in progress_bar:
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            action = env.action_space.sample()
-            action_t = torch.tensor(action, dtype=torch.float32, device=device)
+            action_t = agent.policy.forward(obs_t)
             next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
 
             next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
@@ -402,6 +413,9 @@ def main():
 
             if terminated or truncated:
                 episode_lengths = 0
+        
+        if step >= agent.learning_starts:
+            pass
 
     env.close()
         
