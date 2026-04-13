@@ -19,6 +19,8 @@ agent :
     gamma : 0.99
     tau : 0.95
     policy_samples : 100
+    e_step_epsilon : None #TODO: what default value
+    n_temp_dual_steps : 200
 
 buffer :
   batch_size : 256  # Much larger for stable gradients
