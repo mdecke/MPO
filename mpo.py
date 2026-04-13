@@ -1,8 +1,9 @@
 import os
 import copy
-from typing import List, Dict, Tuple, Optional
-from tqdm import tqdm
+import yaml
 import argparse
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,8 +12,8 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 import torch.distributions as dist
 
 parser = argparse.ArgumentParser(description="MPO experiment setup")
@@ -46,6 +47,11 @@ def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1, seed:int=
                 nn.init.normal_(param, mean=mean, std=std)
             elif "bias" in name:
                 nn.init.normal_(param, mean=mean, std=std)
+
+def load_config(config_dict_path:str, args) -> Dict:
+    with open(config_dict_path, 'r') as file:
+        config = yaml.safe_load(file)
+    return config
 
 
 class Buffer:
@@ -173,13 +179,16 @@ class Actor(nn.Module):
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
-    def forward(self, input:torch.Tensor) -> torch.Tensor:
+    def forward(self, input:torch.Tensor, n_samples:int=1) -> torch.Tensor:
         logits = self.net(input)
         mu = self.mu_head(logits)
         log_sigma = self.log_sigma_head(logits)
         if self.training:
             sigma = torch.exp(log_sigma) + 1e-6 #ensure std is non zero
-            actions = torch.normal(mu, sigma)
+            mu_expanded = mu.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
+            sigma_expanded = sigma.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
+            normal_dist = dist.Normal(mu_expanded,sigma_expanded)
+            actions = normal_dist.rsample() #reparametrization trick conserves gradients
         else:
             actions = mu
         bounded_actions = torch.tanh(actions) * self.action_limit
@@ -226,6 +235,7 @@ class MPO_Agent():
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
+        self.policy_samples = self.cfg.get('agent', {}).get('params',{}).get('policy_samples', 1)
 
         self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
         self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
@@ -248,6 +258,8 @@ class MPO_Agent():
 
         self._init_buffer()
         self._init_models()
+
+        self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=device)
 
         self.critic_loss = []
         self.policy_loss = []
@@ -308,6 +320,15 @@ class MPO_Agent():
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_gradient_clipping)
         
         self.critic.optimizer.step()
+
+    def e_step(self,
+               batch_data: Dict[str, torch.Tensor]):
+        obs = batch_data['obs'][:,-1,:] #shape = (batch_sz, 1, obs_dim)
+        for i,state in zip(range(self.batch_sz),obs):
+            sampled_actions = self.target_policy.forward(state.unsqueeze(0),self.policy_samples).squeeze(0) #shape = (1, n_samples, act_dim) 
+            for j in range(self.policy_samples):
+                self.evaluted_q[i,j] = self.critic.forward(state=state,action=sampled_actions[j,:])
+
         
 
 
