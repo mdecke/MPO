@@ -51,6 +51,22 @@ def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1, seed:int=
 def load_config(config_dict_path:str, args) -> Dict:
     with open(config_dict_path, 'r') as file:
         config = yaml.safe_load(file)
+    
+    cli_to_yaml = {
+        'task':             ('general', 'task'),
+        'n_envs':           ('general', 'n_envs'),
+        'max_interactions':  ('training', 'max_interactions'),
+    }
+
+    for arg_name, yaml_path in cli_to_yaml.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            # walk into nested dict, create intermediate dicts if missing
+            d = config
+            for key in yaml_path[:-1]:
+                d = d.setdefault(key, {})
+            d[yaml_path[-1]] = value
+
     return config
 
 
