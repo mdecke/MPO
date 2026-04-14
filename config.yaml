@@ -1,4 +1,4 @@
-general: 
+environment: 
   seed : 42
   device : cpu
 
@@ -32,6 +32,3 @@ training :
   max_interactions : 10000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 1000
-
-
-
