@@ -451,6 +451,13 @@ class MPO_Agent():
         self.policy.optimizer.step()
         self.policy_loss.append(policy_loss.item())
 
+    def _update_targets(self) -> None:
+        for p, p_tgt in zip(self.policy.parameters(), self.target_policy.parameters()):
+            p_tgt.data.lerp_(p.data, 1 - self.tau)
+        for p, p_tgt in zip(self.critic.parameters(), self.target_critic.parameters()):
+            p_tgt.data.lerp_(p.data, 1 - self.tau)
+
+
 
 def main():
     env = gym.make_vec(args.task, args.n_envs)
