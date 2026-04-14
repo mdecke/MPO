@@ -72,13 +72,16 @@ def load_config(config_dict_path:str, args) -> Dict:
 
 class Buffer:
     def __init__(self,
-                 cfg:Optional[Dict],
+                 cfg:Dict,
                  action_dtype:torch.dtype=torch.float32):
-    
-        self.N = cfg['buffer_size']
-        self.envs = cfg['n_envs']
-        self.obs_dim = cfg['observation_dim']
-        self.act_dim = cfg['action_dim']
+        self.cfg = cfg
+
+        self.N = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
+
+        self.envs = self.cfg.get('general', {}).get('n_envs', 1)
+        self.obs_dim = self.cfg.get('general', {}).get('obs_dim', 1)
+        self.act_dim = self.cfg.get('general', {}).get('act_dim', 1)
+        self.device = self.cfg.get('general', {}).get('device', 'cpu')
         
         #Set up correct shape for arrays
         if isinstance(self.obs_dim, int):
@@ -89,8 +92,6 @@ class Buffer:
             act_shape = (self.act_dim,)
         else:
             act_shape = tuple(self.act_dim)
-        
-        self.device = cfg['device']
 
         # Sequence of Arrays (SoA) --> each variable is stored in a (N by #_envs) tensor
         self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=device)
@@ -279,11 +280,8 @@ class MPO_Agent():
         self.mean_q_value = []
 
     def _init_buffer(self) -> None:
-        self.buffer = Buffer(self.buffer_sz,
-                             self.n_envs,
-                             self.obs_dim,
-                             self.act_dim
-                             )
+        self.buffer = Buffer(self.cfg)
+
         print("[INFO]: Memory class initialized")
 
     def _init_models(self) -> None:
@@ -386,10 +384,13 @@ def main():
     cfg = load_config(config_path, args)
 
     env = gym.make(args.task)
-    obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape
-    data_buffer = Buffer(cfg=cfg) #TODO: buffer only needs buffer cfg, not explicit
+    cfg['general']['obs_dim'] = env.observation_space.shape
+    cfg['general']['act_dim'] = env.action_space.shape
 
+    print(cfg)
+    data_buffer = Buffer(cfg=cfg) #TODO: buffer only needs buffer cfg, not explicit
+    print('data buffer inited')
+    quit()
     training_steps_per_env = np.ceil(args.env_interactions/args.n_envs).astype(int)
     progress_bar = tqdm(range(training_steps_per_env), unit="step")
 
