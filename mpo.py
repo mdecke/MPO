@@ -200,6 +200,7 @@ class Actor(nn.Module):
     
     def sample(self, input:torch.Tensor, n_samples:int=1) -> torch.Tensor:
         mu,sigma = self.forward(input)
+        print(mu,sigma)
         mu_expanded = mu.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
         sigma_expanded = sigma.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
         normal_dist = dist.Normal(mu_expanded,sigma_expanded)
@@ -386,19 +387,19 @@ class MPO_Agent():
         
 
 def main():
+    env = gym.make_vec(args.task, args.n_envs)
+    
     cwd = os.getcwd()
     config_path = os.path.join(cwd,'config.yaml')
     cfg = load_config(config_path, args)
+    cfg['environment']['obs_dim'] = env.observation_space.shape[-1]
+    cfg['environment']['act_dim'] = env.action_space.shape[-1]
+    cfg['environment']['act_lim'] = env.action_space.high.flat[0] #assume symetric limits: [-a;a]
 
-    env = gym.make(args.task)
-    cfg['environment']['obs_dim'] = env.observation_space.shape[0]
-    cfg['environment']['act_dim'] = env.action_space.shape[0]
-    cfg['environment']['act_lim'] = env.action_space.high.item() #assume symetric limits: [-a;a]
-
-    print(cfg)
     agent = MPO_Agent(cfg=cfg)
-    quit()
     agent._train()
+
+    progress_bar = tqdm(range(agent.training_steps))
 
     obs, _ = env.reset()
 
@@ -408,7 +409,7 @@ def main():
     for step in progress_bar:
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            action_t = agent.policy.forward(obs_t)
+            action_t = agent.policy.sample(obs_t)
             next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
 
             next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
