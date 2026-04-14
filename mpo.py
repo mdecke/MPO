@@ -191,28 +191,30 @@ class Actor(nn.Module):
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
-    def forward(self, input:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: torch.Tensor) -> dist.Normal:
         logits = self.net(input)
         mu = self.mu_head(logits)
         log_sigma = self.log_sigma_head(logits)
-        sigma = torch.exp(log_sigma) + 1e-6 #ensure std is non zero
-        return mu, sigma
-    
-    def sample(self, input:torch.Tensor, n_samples:int=1) -> torch.Tensor:
-        mu,sigma = self.forward(input)
-        print(mu,sigma)
-        mu_expanded = mu.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
-        sigma_expanded = sigma.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
-        normal_dist = dist.Normal(mu_expanded,sigma_expanded)
-        actions = normal_dist.rsample() #reparametrization trick conserves gradients
-        action_log_probs = normal_dist.log_prob(actions)
-        bounded_actions = torch.tanh(actions) * self.action_limit
-        return bounded_actions, action_log_probs
+        sigma = torch.exp(log_sigma) + 1e-6
+        return dist.Normal(mu, sigma)
 
-    def infrence(self, input:torch.Tensor) -> torch.Tensor:
-        actions,_ = self.forward(input)
-        bounded_actions = torch.tanh(actions) * self.action_limit
-        return bounded_actions
+    def get_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Deterministic inference (mean action)."""
+        return torch.tanh(self.forward(obs).mean) * self.action_limit
+
+    def sample(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stochastic sample(s) with log probs — for data collection and E-step."""
+        d = self.forward(obs)
+        # expand for n_samples: (batch, n_samples, act_dim)
+        actions = d.rsample((n_samples,)).permute(1, 0, 2)
+        log_probs = d.log_prob(actions.permute(1, 0, 2)).permute(1, 0, 2)
+        bounded = torch.tanh(actions) * self.action_limit
+        bounded = bounded.squeeze(1) if n_samples==1 else bounded
+        return bounded, log_probs
+
+    def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Log prob of given actions under current policy — for the M-step."""
+        return self.forward(obs).log_prob(actions)
 
 class Critic(nn.Module):
     def __init__(self,
@@ -388,7 +390,7 @@ class MPO_Agent():
 
 def main():
     env = gym.make_vec(args.task, args.n_envs)
-    
+
     cwd = os.getcwd()
     config_path = os.path.join(cwd,'config.yaml')
     cfg = load_config(config_path, args)
@@ -409,7 +411,8 @@ def main():
     for step in progress_bar:
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            action_t = agent.policy.sample(obs_t)
+            action_t, _ = agent.policy.sample(obs_t)
+            
             next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
 
             next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
