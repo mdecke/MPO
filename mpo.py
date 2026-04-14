@@ -191,18 +191,25 @@ class Actor(nn.Module):
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
-    def forward(self, input:torch.Tensor, n_samples:int=1) -> torch.Tensor:
+    def forward(self, input:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.net(input)
         mu = self.mu_head(logits)
         log_sigma = self.log_sigma_head(logits)
-        if self.training:
-            sigma = torch.exp(log_sigma) + 1e-6 #ensure std is non zero
-            mu_expanded = mu.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
-            sigma_expanded = sigma.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
-            normal_dist = dist.Normal(mu_expanded,sigma_expanded)
-            actions = normal_dist.rsample() #reparametrization trick conserves gradients
-        else:
-            actions = mu
+        sigma = torch.exp(log_sigma) + 1e-6 #ensure std is non zero
+        return mu, sigma
+    
+    def sample(self, input:torch.Tensor, n_samples:int=1) -> torch.Tensor:
+        mu,sigma = self.forward(input)
+        mu_expanded = mu.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
+        sigma_expanded = sigma.unsqueeze(1).expand(-1,n_samples,-1) #shape = (bch_sz,n_samples,act_dim)
+        normal_dist = dist.Normal(mu_expanded,sigma_expanded)
+        actions = normal_dist.rsample() #reparametrization trick conserves gradients
+        action_log_probs = normal_dist.log_prob(actions)
+        bounded_actions = torch.tanh(actions) * self.action_limit
+        return bounded_actions, action_log_probs
+
+    def infrence(self, input:torch.Tensor) -> torch.Tensor:
+        actions,_ = self.forward(input)
         bounded_actions = torch.tanh(actions) * self.action_limit
         return bounded_actions
 
