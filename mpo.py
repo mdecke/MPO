@@ -78,10 +78,10 @@ class Buffer:
 
         self.N = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
 
-        self.envs = self.cfg.get('general', {}).get('n_envs', 1)
-        self.obs_dim = self.cfg.get('general', {}).get('obs_dim', 1)
-        self.act_dim = self.cfg.get('general', {}).get('act_dim', 1)
-        self.device = self.cfg.get('general', {}).get('device', 'cpu')
+        self.envs = self.cfg.get('environment', {}).get('n_envs', 1)
+        self.obs_dim = self.cfg.get('environment', {}).get('obs_dim', 1)
+        self.act_dim = self.cfg.get('environment', {}).get('act_dim', 1)
+        self.device = self.cfg.get('environment', {}).get('device', 'cpu')
         
         #Set up correct shape for arrays
         if isinstance(self.obs_dim, int):
@@ -273,8 +273,8 @@ class MPO_Agent():
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
 
-        self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_sz', 1_000_000)
-        self.batch_sz = self.cfg.get('buffer', {}).get('batch_sz', 256)
+        self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
+        self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
         self.td_horizon = self.cfg.get('buffer', {}).get('td_horizon', 1)
 
         self._init_buffer()
