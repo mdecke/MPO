@@ -260,6 +260,9 @@ class MPO_Agent():
         self.policy_samples = self.cfg.get('agent', {}).get('params',{}).get('policy_samples', 1)
         self.e_step_epsilon = self.cfg.get('agent', {}).get('params',{}).get('e_step_epsilon', 1)
         self.n_temp_dual_steps = self.cfg.get('agent', {}).get('params',{}).get('n_temp_dual_steps', 200)
+        self.m_step_epsilon_mu = self.cfg.get('agent', {}).get('params',{}).get('m_step_epsilon_mu', 0.1)
+        self.m_step_epsilon_sigma = self.cfg.get('agent', {}).get('params',{}).get('m_step_epsilon_sigma', 1e-4)
+        self.n_kl_dual_steps = self.cfg.get('agent', {}).get('params',{}).get('n_kl_dual_steps', 100)
 
         self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
         self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
@@ -355,6 +358,7 @@ class MPO_Agent():
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_gradient_clipping)
         
         self.critic.optimizer.step()
+        self.critic_loss.append(critic_loss.item())
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
@@ -375,6 +379,20 @@ class MPO_Agent():
         weights = torch.softmax(q_values/eta_star, dim=-1)
         return eta_star, weights
 
+    def solve_kl_dual(self, kl_value: torch.Tensor, epsilon: float, n_dual_steps: int = 100) -> torch.Tensor:
+        log_alpha = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        dual_optimizer = optim.Adam([log_alpha], lr=1e-2)
+        kl = kl_value.detach()
+
+        for _ in range(n_dual_steps):
+            dual_optimizer.zero_grad()
+            alpha = log_alpha.exp()
+            dual_loss = alpha * (epsilon - kl)
+            dual_loss.backward()
+            dual_optimizer.step()
+
+        return log_alpha.exp().detach()
+
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
@@ -390,7 +408,49 @@ class MPO_Agent():
         eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
 
         return sampled_actions, weights, eta
-        
+
+    def m_step(self,
+               obs: torch.Tensor,
+               sampled_actions: torch.Tensor,
+               weights: torch.Tensor) -> None:
+        # Weighted NLL (supervised fit to E-step distribution)
+        obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1)
+        log_probs = self.policy.log_prob(obs_exp, sampled_actions)  # (batch_sz, policy_samples, act_dim)
+        nll = -(weights.detach() * log_probs.sum(-1)).sum(-1).mean()
+
+        # Decoupled KL constraints
+        curr_d = self.policy.forward(obs)
+        old_d = self.target_policy.forward(obs)
+        mu_old, sigma_old = old_d.loc.detach(), old_d.scale.detach()
+
+        # D_KL^μ: sg on sigma_theta — gradients flow only through mu_theta
+        kl_mu = dist.kl_divergence(
+            dist.Normal(curr_d.loc, curr_d.scale.detach()),
+            dist.Normal(mu_old, sigma_old)
+        ).sum(-1).mean()
+
+        # D_KL^Σ: sg on mu_theta — gradients flow only through sigma_theta
+        kl_sigma = dist.kl_divergence(
+            dist.Normal(curr_d.loc.detach(), curr_d.scale),
+            dist.Normal(mu_old, sigma_old)
+        ).sum(-1).mean()
+
+        alpha_mu = self.solve_kl_dual(kl_mu, self.m_step_epsilon_mu, self.n_kl_dual_steps)
+        alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
+
+        policy_loss = (nll
+                       + alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
+                       + alpha_sigma * (kl_sigma - self.m_step_epsilon_sigma))
+
+        self.policy.optimizer.zero_grad()
+        policy_loss.backward()
+
+        if self.policy_gradient_clipping:
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.policy_gradient_clipping)
+
+        self.policy.optimizer.step()
+        self.policy_loss.append(policy_loss.item())
+
 
 def main():
     env = gym.make_vec(args.task, args.n_envs)
