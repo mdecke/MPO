@@ -377,14 +377,18 @@ class MPO_Agent():
 
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = batch_data['obs'][:,-1,:] #shape = (batch_sz, 1, obs_dim)
-        for i,state in zip(range(self.batch_sz),obs):
-            sampled_actions = self.target_policy.forward(state.unsqueeze(0),self.policy_samples).squeeze(0) #shape = (1, n_samples, act_dim) 
-            for j in range(self.policy_samples):
-                self.evaluted_q[i,j] = self.critic.forward(state=state,action=sampled_actions[j,:])
-        
+        obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
+
+        sampled_actions, _ = self.target_policy.sample(obs, n_samples=self.policy_samples)
+
+        # Expand obs and flatten actions for a single critic forward pass
+        obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
+        acts_flat = sampled_actions.reshape(-1, sampled_actions.shape[-1])
+
+        self.evaluted_q = self.critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
+
         eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
-        
+
         return sampled_actions, weights, eta
         
 
