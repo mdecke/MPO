@@ -53,8 +53,8 @@ def load_config(config_dict_path:str, args) -> Dict:
         config = yaml.safe_load(file)
     
     cli_to_yaml = {
-        'task':             ('general', 'task'),
-        'n_envs':           ('general', 'n_envs'),
+        'task':             ('environment', 'task'),
+        'n_envs':           ('environment', 'n_envs'),
         'max_interactions':  ('training', 'max_interactions'),
     }
 
@@ -211,7 +211,7 @@ class Critic(nn.Module):
                  input_dim:int,
                  hidden_dims:List[int],
                  lr:float,
-                 actv_fct:str,
+                 activation_fct:str,
                  output_dim:int=1):
         super().__init__()
         self.input_dim = input_dim
@@ -224,7 +224,7 @@ class Critic(nn.Module):
 
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(get_activation(actv_fct))
+            layers.append(get_activation(activation_fct))
             prev_dim = hidden_dim
         
         layers.append(nn.Linear(prev_dim, self.output_dim)) # Q(s,a): R_s x R_a --> R
@@ -240,10 +240,10 @@ class MPO_Agent():
     def __init__(self,cfg:Dict):
         self.cfg = cfg
 
-        self.obs_dim = self.cfg.get('env',{}).get('obs_dim')
-        self.act_dim = self.cfg.get('env',{}).get('act_dim')
-        self.act_lim = self.cfg.get('env',{}).get('lim', 1.0)
-        self.n_envs = self.cfg.get('env',{}).get('n_envs')
+        self.obs_dim = self.cfg.get('environment',{}).get('obs_dim')
+        self.act_dim = self.cfg.get('environment',{}).get('act_dim')
+        self.act_lim = self.cfg.get('environment',{}).get('act_lim', 1.0)
+        self.n_envs = self.cfg.get('environment',{}).get('n_envs')
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
@@ -307,6 +307,8 @@ class MPO_Agent():
             p.requires_grad = False
         for p in self.target_critic.parameters():
             p.requires_grad = False
+        
+        print("[INFO]: Models initialized")
 
     def _train(self) -> None:
         self.policy.train()
@@ -376,26 +378,19 @@ class MPO_Agent():
         return sampled_actions, weights, eta
         
 
-
-
 def main():
     cwd = os.getcwd()
     config_path = os.path.join(cwd,'config.yaml')
     cfg = load_config(config_path, args)
 
     env = gym.make(args.task)
-    cfg['general']['obs_dim'] = env.observation_space.shape
-    cfg['general']['act_dim'] = env.action_space.shape
+    cfg['environment']['obs_dim'] = env.observation_space.shape[0]
+    cfg['environment']['act_dim'] = env.action_space.shape[0]
+    cfg['environment']['act_lim'] = env.action_space.high.item() #assume symetric limits: [-a;a]
 
     print(cfg)
-    data_buffer = Buffer(cfg=cfg) #TODO: buffer only needs buffer cfg, not explicit
-    print('data buffer inited')
+    agent = MPO_Agent(cfg=cfg)
     quit()
-    training_steps_per_env = np.ceil(args.env_interactions/args.n_envs).astype(int)
-    progress_bar = tqdm(range(training_steps_per_env), unit="step")
-
-
-    agent = MPO_Agent()
     agent._train()
 
     obs, _ = env.reset()
@@ -416,12 +411,12 @@ def main():
             cumulative_reward += reward_tensor
             episode_lengths += 1
 
-            data_buffer.add_sample(obs_t, action_t, next_obs_tensor, reward_tensor, truncated_tensor, terminated_tensor)
+            agent.buffer.add_sample(obs_t, action_t, next_obs_tensor, reward_tensor, truncated_tensor, terminated_tensor)
 
             obs = next_obs
 
             if step > td_horizon:
-                print(data_buffer.sample(td_horizon))
+                print(agent.buffer.sample(td_horizon))
 
             if terminated or truncated:
                 episode_lengths = 0
@@ -432,7 +427,5 @@ def main():
     env.close()
         
     
-
-
 if __name__ == "__main__":
     main()
