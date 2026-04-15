@@ -19,7 +19,7 @@ import torch.distributions as dist
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
-parser.add_argument('--max_interactions', type=int, default=1_000, help="number of total steps across envs")
+parser.add_argument('--max_interactions', type=int, default=1_000_000, help="number of total steps across envs")
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -337,7 +337,7 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        next_action = self.target_policy.forward(input=batch_data["next_obs"][:,-1,:])
+        next_action,_ = self.target_policy.sample(obs=batch_data["next_obs"][:,-1,:])
         q_target = self.target_critic.forward(state=batch_data['next_obs'][:,-1,:], action=next_action)
 
         #temporal diff
@@ -367,12 +367,13 @@ class MPO_Agent():
 
         q_values = q_samples.detach()
 
-        for _ in range(n_dual_steps):
-            dual_optimizer.zero_grad()
-            eta = log_eta.exp()
-            dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(n_samples)).mean()
-            dual_loss.backward()
-            dual_optimizer.step()
+        with torch.enable_grad():
+            for _ in range(n_dual_steps):
+                dual_optimizer.zero_grad()
+                eta = log_eta.exp()
+                dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(torch.tensor(n_samples))).mean()
+                dual_loss.backward()
+                dual_optimizer.step()
         
         eta_star = log_eta.exp().detach()
 
@@ -384,12 +385,13 @@ class MPO_Agent():
         dual_optimizer = optim.Adam([log_alpha], lr=1e-2)
         kl = kl_value.detach()
 
-        for _ in range(n_dual_steps):
-            dual_optimizer.zero_grad()
-            alpha = log_alpha.exp()
-            dual_loss = alpha * (epsilon - kl)
-            dual_loss.backward()
-            dual_optimizer.step()
+        with torch.enable_grad():
+            for _ in range(n_dual_steps):
+                dual_optimizer.zero_grad()
+                alpha = log_alpha.exp()
+                dual_loss = alpha * (epsilon - kl)
+                dual_loss.backward()
+                dual_optimizer.step()
 
         return log_alpha.exp().detach()
 
@@ -468,7 +470,7 @@ class MPO_Agent():
         self.m_step(obs, sampled_actions, weights)
         self._update_targets()
 
-    def train_agent(self, envs: gym.VectorEnv) -> None:
+    def train_agent(self, envs: gym.Env) -> None:
         self._train()
         obs, _ = envs.reset()
 
