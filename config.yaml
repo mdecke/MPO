@@ -22,6 +22,9 @@ agent :
     policy_samples : 100
     e_step_epsilon : 1 #TODO: what default value
     n_temp_dual_steps : 200
+    m_step_epsilon_mu : 0.1
+    m_step_epsilon_sigma : 0.0001
+    n_kl_dual_steps : 100
 
 buffer :
   batch_size : 256  # Much larger for stable gradients
@@ -29,6 +32,6 @@ buffer :
   td_horizon : 1
 
 training :
-  max_interactions : 10000
+  max_interactions : 1000000
   warm_up : 1000  # Fill buffer before training
-  learning_starts : 1000
+  learning_starts : 5000
