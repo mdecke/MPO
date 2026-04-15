@@ -7,14 +7,16 @@ agent :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'tanh'
+    layer_norm : false
     gradient_clip : 5.0
     update_delay : 10
-  
-  critic : 
+
+  critic :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'elu'
-    gradient_clip : 5.0 
+    layer_norm : false
+    gradient_clip : 5.0
   
   params:
     gamma : 0.99
@@ -27,11 +29,11 @@ agent :
     n_kl_dual_steps : 100
 
 buffer :
-  batch_size : 256  # Much larger for stable gradients
+  batch_size : 64  # Much larger for stable gradients
   buffer_size : 1000000
   td_horizon : 1
 
 training :
-  max_interactions : 1000000
+  max_interactions : 200000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 5000

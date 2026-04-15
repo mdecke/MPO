@@ -19,7 +19,7 @@ import torch.distributions as dist
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
-parser.add_argument('--max_interactions', type=int, default=1_000_000, help="number of total steps across envs")
+parser.add_argument('--max_interactions', type=int, default=200000, help="number of total steps across envs")
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -168,6 +168,7 @@ class Actor(nn.Module):
                  hidden_dims:List[int],
                  lr:float,
                  activation_fct:str,
+                 layer_norm:bool=False,
                  seed:int=42):
         super().__init__()
 
@@ -181,6 +182,8 @@ class Actor(nn.Module):
 
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
             layers.append(get_activation(activation_fct))
             prev_dim = hidden_dim
         
@@ -199,21 +202,20 @@ class Actor(nn.Module):
         return dist.Normal(mu, sigma)
 
     def get_action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic inference (mean action)."""
         return torch.tanh(self.forward(obs).mean) * self.action_limit
 
-    def sample(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Stochastic sample(s) with log probs — for data collection and E-step."""
+    def sample(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         d = self.forward(obs)
         # expand for n_samples: (batch, n_samples, act_dim)
-        actions = d.rsample((n_samples,)).permute(1, 0, 2)
-        log_probs = d.log_prob(actions.permute(1, 0, 2)).permute(1, 0, 2)
-        bounded = torch.tanh(actions) * self.action_limit
-        bounded = bounded.squeeze(1) if n_samples==1 else bounded
-        return bounded, log_probs
+        raw = d.rsample((n_samples,)).permute(1, 0, 2)  # pre-tanh
+        log_probs = d.log_prob(raw.permute(1, 0, 2)).permute(1, 0, 2)
+        bounded = torch.tanh(raw) * self.action_limit
+        if n_samples == 1:
+            raw = raw.squeeze(1)
+            bounded = bounded.squeeze(1)
+        return bounded, raw, log_probs
 
     def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """Log prob of given actions under current policy — for the M-step."""
         return self.forward(obs).log_prob(actions)
 
 class Critic(nn.Module):
@@ -222,6 +224,7 @@ class Critic(nn.Module):
                  hidden_dims:List[int],
                  lr:float,
                  activation_fct:str,
+                 layer_norm:bool=False,
                  output_dim:int=1):
         super().__init__()
         self.input_dim = input_dim
@@ -231,9 +234,10 @@ class Critic(nn.Module):
         layers = []
         prev_dim = self.input_dim
 
-
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
             layers.append(get_activation(activation_fct))
             prev_dim = hidden_dim
         
@@ -267,11 +271,13 @@ class MPO_Agent():
         self.policy_layers = self.cfg.get('agent',{}).get('policy',{}).get('hidden_layers',[])
         self.policy_lr = self.cfg.get('agent',{}).get('policy',{}).get('lr', 0.001)
         self.policy_actv_fct = self.cfg.get('agent',{}).get('policy',{}).get('act_fct', 'relu')
+        self.policy_layer_norm = self.cfg.get('agent',{}).get('policy',{}).get('layer_norm', False)
         self.policy_gradient_clipping = self.cfg.get('agent',{}).get('policy',{}).get('gradient_clip', None)
-        
+
         self.critic_layers = self.cfg.get('agent',{}).get('critic',{}).get('hidden_layers',[])
         self.critic_lr = self.cfg.get('agent',{}).get('critic',{}).get('lr', 0.001)
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
+        self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
 
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
@@ -303,11 +309,13 @@ class MPO_Agent():
                             action_limit=self.act_lim,  # Assuming symmetric action bounds
                             hidden_dims=self.policy_layers,
                             lr=self.policy_lr,
-                            activation_fct=self.policy_actv_fct)
+                            activation_fct=self.policy_actv_fct,
+                            layer_norm=self.policy_layer_norm)
         self.critic = Critic(input_dim=self.obs_dim+self.act_dim,
                              hidden_dims=self.critic_layers,
                              lr=self.critic_lr,
-                             activation_fct=self.critic_actv_fct)
+                             activation_fct=self.critic_actv_fct,
+                             layer_norm=self.critic_layer_norm)
         
         init_model_weights(self.policy)
         init_model_weights(self.critic)
@@ -337,7 +345,7 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        next_action,_ = self.target_policy.sample(obs=batch_data["next_obs"][:,-1,:])
+        next_action, _, _ = self.target_policy.sample(obs=batch_data["next_obs"][:,-1,:])
         q_target = self.target_critic.forward(state=batch_data['next_obs'][:,-1,:], action=next_action)
 
         #temporal diff
@@ -399,17 +407,17 @@ class MPO_Agent():
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
 
-        sampled_actions, _ = self.target_policy.sample(obs, n_samples=self.policy_samples)
+        bounded_actions, raw_actions, _ = self.target_policy.sample(obs, n_samples=self.policy_samples)
 
-        # Expand obs and flatten actions for a single critic forward pass
+        # Expand obs and flatten bounded actions for critic (critic trained on post-tanh actions)
         obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
-        acts_flat = sampled_actions.reshape(-1, sampled_actions.shape[-1])
+        acts_flat = bounded_actions.reshape(-1, bounded_actions.shape[-1])
 
-        self.evaluted_q = self.critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
+        self.evaluted_q = self.target_critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
 
         eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
 
-        return sampled_actions, weights, eta
+        return raw_actions, weights, eta
 
     def m_step(self,
                obs: torch.Tensor,
@@ -481,7 +489,7 @@ class MPO_Agent():
         for step in progress_bar:
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                action_t, _ = self.policy.sample(obs_t)
+                action_t, _, _ = self.policy.sample(obs_t)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
 
