@@ -468,55 +468,62 @@ class MPO_Agent():
         self.m_step(obs, sampled_actions, weights)
         self._update_targets()
 
+    def train_agent(self, envs: gym.VectorEnv) -> None:
+        self._train()
+        obs, _ = envs.reset()
+
+        episode_returns = torch.zeros(self.n_envs, device=device)
+        episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=device)
+
+        progress_bar = tqdm(range(self.training_steps))
+        for step in progress_bar:
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+                action_t, _ = self.policy.sample(obs_t)
+
+            next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
+
+            reward_t = torch.as_tensor(reward, dtype=torch.float32, device=device)
+            terminated_t = torch.as_tensor(terminated, dtype=torch.bool, device=device)
+            truncated_t = torch.as_tensor(truncated, dtype=torch.bool, device=device)
+            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+
+            self.buffer.add_sample(obs_t, action_t, next_obs_t, reward_t, truncated_t, terminated_t)
+            obs = next_obs
+
+            episode_returns += reward_t
+            episode_lengths += 1
+
+            done = terminated_t | truncated_t
+            if done.any():
+                mean_return = episode_returns[done].mean().item()
+                mean_length = episode_lengths[done].float().mean().item()
+                progress_bar.set_postfix({
+                    "return": f"{mean_return:.1f}",
+                    "ep_len": f"{mean_length:.0f}",
+                    "step": step,
+                })
+                episode_returns[done] = 0.0
+                episode_lengths[done] = 0
+
+            if step >= self.learning_starts:
+                self.update()
+
+        envs.close()
+
 
 def main():
     env = gym.make_vec(args.task, args.n_envs)
 
     cwd = os.getcwd()
-    config_path = os.path.join(cwd,'config.yaml')
+    config_path = os.path.join(cwd, 'config.yaml')
     cfg = load_config(config_path, args)
     cfg['environment']['obs_dim'] = env.observation_space.shape[-1]
     cfg['environment']['act_dim'] = env.action_space.shape[-1]
-    cfg['environment']['act_lim'] = env.action_space.high.flat[0] #assume symetric limits: [-a;a]
+    cfg['environment']['act_lim'] = env.action_space.high.flat[0]  # assume symmetric limits [-a, a]
 
     agent = MPO_Agent(cfg=cfg)
-    agent._train()
-
-    progress_bar = tqdm(range(agent.training_steps))
-
-    obs, _ = env.reset()
-
-    td_horizon = 4
-    cumulative_reward = 0.0
-    episode_lengths = 0
-    for step in progress_bar:
-        with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            action_t, _ = agent.policy.sample(obs_t)
-            
-            next_obs, reward, terminated, truncated, info = env.step(action_t.cpu().numpy())
-
-            next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device).view(args.n_envs, -1)
-            reward_tensor = torch.as_tensor(reward, dtype=torch.float32, device=device).view(args.n_envs, -1)
-            terminated_tensor = torch.as_tensor(terminated, dtype=torch.bool, device=device).view(args.n_envs, -1)
-            truncated_tensor = torch.as_tensor(truncated, dtype=torch.bool, device=device).view(args.n_envs, -1)
-            cumulative_reward += reward_tensor
-            episode_lengths += 1
-
-            agent.buffer.add_sample(obs_t, action_t, next_obs_tensor, reward_tensor, truncated_tensor, terminated_tensor)
-
-            obs = next_obs
-
-            if step > td_horizon:
-                print(agent.buffer.sample(td_horizon))
-
-            if terminated or truncated:
-                episode_lengths = 0
-        
-        if step >= agent.learning_starts:
-            pass
-
-    env.close()
+    agent.train_agent(env)
         
     
 if __name__ == "__main__":
