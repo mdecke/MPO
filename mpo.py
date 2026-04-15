@@ -457,6 +457,16 @@ class MPO_Agent():
         for p, p_tgt in zip(self.critic.parameters(), self.target_critic.parameters()):
             p_tgt.data.lerp_(p.data, 1 - self.tau)
 
+    def update(self) -> None:
+        batch = self.buffer.sample(self.batch_sz, self.td_horizon)
+        self.update_critic(batch)
+
+        obs = batch['obs'][:, -1, :]
+        with torch.no_grad():
+            sampled_actions, weights, _ = self.e_step(batch)
+
+        self.m_step(obs, sampled_actions, weights)
+        self._update_targets()
 
 
 def main():
