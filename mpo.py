@@ -16,6 +16,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as dist
 
+import time
+
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
@@ -292,6 +294,16 @@ class MPO_Agent():
         self._init_buffer()
         self._init_models()
 
+        #dual pb init:
+        self.log_eta = torch.tensor(1.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=1e-2)
+
+        self.log_alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.dual_kl_mu_optimizer = optim.Adam([self.log_alpha_mu], lr=1e-2)
+
+        self.log_alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.dual_kl_sigma_optimizer = optim.Adam([self.log_alpha_sigma], lr=1e-2)
+
         self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=device)
 
         self.critic_loss = []
@@ -370,25 +382,23 @@ class MPO_Agent():
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
-        log_eta = torch.tensor(1.0, dtype=torch.float32, device=device, requires_grad=True)
-        dual_optimizer = optim.Adam([log_eta], lr=1e-2)
-
         q_values = q_samples.detach()
 
         with torch.enable_grad():
             for _ in range(n_dual_steps):
-                dual_optimizer.zero_grad()
-                eta = log_eta.exp()
+                self.dual_temp_optimizer.zero_grad()
+                eta = self.log_eta.exp()
                 dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(torch.tensor(n_samples))).mean()
                 dual_loss.backward()
-                dual_optimizer.step()
-        
-        eta_star = log_eta.exp().detach()
+                self.dual_temp_optimizer.step()
+                self.log_eta.data.clamp_(-4.0, 4.0)  # keep eta in [~0.02, ~55], prevents q/eta overflow
+
+        eta_star = self.log_eta.exp().detach()
 
         weights = torch.softmax(q_values/eta_star, dim=-1)
         return eta_star, weights
 
-    def solve_kl_dual(self, kl_value: torch.Tensor, epsilon: float, n_dual_steps: int = 100) -> torch.Tensor:
+    def solve_kl_dual(self, kl_value: torch.Tensor, epsilon: float, n_dual_steps: int = 30) -> torch.Tensor:
         log_alpha = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
         dual_optimizer = optim.Adam([log_alpha], lr=1e-2)
         kl = kl_value.detach()
@@ -445,8 +455,12 @@ class MPO_Agent():
             dist.Normal(mu_old, sigma_old)
         ).sum(-1).mean()
 
-        alpha_mu = self.solve_kl_dual(kl_mu, self.m_step_epsilon_mu, self.n_kl_dual_steps)
-        alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
+        # alpha_mu = self.solve_kl_dual(kl_mu, self.m_step_epsilon_mu, self.n_kl_dual_steps)
+        # alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
+
+        # No loop needed
+        alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.0)
+        alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.0)
 
         policy_loss = (nll
                        + alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
@@ -469,14 +483,21 @@ class MPO_Agent():
 
     def update(self) -> None:
         batch = self.buffer.sample(self.batch_sz, self.td_horizon)
+        # t_0_critic = time.perf_counter()
         self.update_critic(batch)
+        # print(f"critic update duration: {time.perf_counter() - t_0_critic}")
 
         obs = batch['obs'][:, -1, :]
         with torch.no_grad():
+            # t_0_e_step = time.perf_counter()
             sampled_actions, weights, _ = self.e_step(batch)
-
+            # print(f"e-step duration: {time.perf_counter() - t_0_e_step}")
+            
+        # t_0_m_step = time.perf_counter()
         self.m_step(obs, sampled_actions, weights)
+        # print(f"m-step duration: {time.perf_counter() - t_0_m_step}")
         self._update_targets()
+        
 
     def train_agent(self, envs: gym.Env) -> None:
         self._train()
@@ -518,6 +539,8 @@ class MPO_Agent():
 
             if step >= self.learning_starts:
                 self.update()
+                # if step == self.learning_starts + 5:
+                #     quit()
 
         envs.close()
 
