@@ -499,12 +499,14 @@ class MPO_Agent():
         self._update_targets()
         
 
-    def train_agent(self, envs: gym.Env) -> None:
+    def train_agent(self, envs: gym.Env, csv_path: str = "training_log.csv") -> None:
         self._train()
         obs, _ = envs.reset()
 
         episode_returns = torch.zeros(self.n_envs, device=device)
         episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=device)
+
+        log_rows = []
 
         progress_bar = tqdm(range(self.training_steps))
         for step in progress_bar:
@@ -534,6 +536,14 @@ class MPO_Agent():
                     "ep_len": f"{mean_length:.0f}",
                     "step": step,
                 })
+                log_rows.append({
+                    "timestep": step * self.n_envs,
+                    "mean_reward": reward_t[done].mean().item(),
+                    "mean_return": mean_return,
+                    "mean_ep_len": mean_length,
+                    "policy_loss": self.policy_loss[-1] if self.policy_loss else float("nan"),
+                    "critic_loss": self.critic_loss[-1] if self.critic_loss else float("nan"),
+                })
                 episode_returns[done] = 0.0
                 episode_lengths[done] = 0
 
@@ -543,6 +553,8 @@ class MPO_Agent():
                 #     quit()
 
         envs.close()
+        pd.DataFrame(log_rows).to_csv(csv_path, index=False)
+        print(f"[INFO]: Training log saved to {csv_path}")
 
 
 def main():
