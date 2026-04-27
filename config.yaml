@@ -6,7 +6,7 @@ agent :
   policy :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
-    act_fct : 'tanh'
+    act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
     update_delay : 10
@@ -14,25 +14,23 @@ agent :
   critic :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
-    act_fct : 'elu'
+    act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
     distributional : false
-    n_atoms : 51
-    ensemble : false
   
   params:
     gamma : 0.99
     tau : 0.95
-    policy_samples : 100
+    policy_samples : 20
     e_step_epsilon : 1 #TODO: what default value
-    n_temp_dual_steps : 20
+    n_temp_dual_steps : 5
     m_step_epsilon_mu : 0.1
     m_step_epsilon_sigma : 0.0001
     n_kl_dual_steps : 100
 
 buffer :
-  batch_size : 64  # Much larger for stable gradients
+  batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
   td_horizon : 1
 
