@@ -1,6 +1,8 @@
 import os
 import copy
+import json
 import yaml
+import random
 import argparse
 from tqdm import tqdm
 from typing import List, Dict, Tuple, Optional
@@ -17,12 +19,16 @@ import torch.nn.functional as F
 import torch.distributions as dist
 
 import time
+from datetime import datetime
 
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
+parser.add_argument('--run_name', type=str, default="train_logs", help='name of csv file with training data')
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
 parser.add_argument('--max_interactions', type=int, default=100000, help="number of total steps across envs")
-parser.add_argument('--distributional', action='store_true', help="use distributional Q-learning (QR-DQN style)")
+parser.add_argument('--save_checkpoint_rate', type=int, default=500, help="rate of env interactions at which the models are saved")
+parser.add_argument('--save_buffer', action='store_true', help='flag to store replay buffer')
+parser.add_argument('--seed', type=int, default=42, help='global random seed (overrides config)')
 args = parser.parse_args()
 
 ACTIVATION_FCTS = {
@@ -39,9 +45,7 @@ def get_activation(name:str='relu') -> nn.Module:
     act_f = ACTIVATION_FCTS[name_lower]
     return act_f()
 
-def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1, seed:int=42) -> None:
-    if seed is not None:
-        torch.manual_seed(seed)
+def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1) -> None:
     for name, param in model.named_parameters():
         if param.requires_grad:
             if "weight" in name:
@@ -57,7 +61,9 @@ def load_config(config_dict_path:str, args) -> Dict:
         'task':             ('environment', 'task'),
         'n_envs':           ('environment', 'n_envs'),
         'max_interactions': ('training', 'max_interactions'),
-        'distributional':   ('agent', 'critic', 'distributional')
+        'save_checkpoint_rate': ('training', 'save_checkpoint_rate'),
+        'save_buffer': ('buffer', 'save_buffer'),
+        'seed':        ('environment', 'seed'),
     }
 
     for arg_name, yaml_path in cli_to_yaml.items():
@@ -273,6 +279,7 @@ class MPO_Agent():
         self.act_dim = self.cfg.get('environment',{}).get('act_dim')
         self.act_lim = self.cfg.get('environment',{}).get('act_lim', 1.0)
         self.n_envs = self.cfg.get('environment',{}).get('n_envs')
+        self.reward_scale = self.cfg.get('training',{}).get('reward_scale', 1.0)
         self.device = self.cfg.get('environment',{}).get('device', 'cpu')
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
@@ -295,18 +302,18 @@ class MPO_Agent():
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
-        self.distributional = self.cfg.get('agent',{}).get('critic',{}).get('distributional', False)
         
 
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
-        self.reward_scale = self.cfg.get('training',{}).get('reward_scale', 1.0)
+        self.save_checkpoint_rate = self.cfg.get('training',{}).get('save_checkpoint_rate', 500)
 
         self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
         self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
         self.td_horizon = self.cfg.get('buffer', {}).get('td_horizon', 1)
+        self.save_buffer = self.cfg.get('buffer',{}).get('save_buffer', False) 
 
         self._init_buffer()
         self._init_models()
@@ -524,9 +531,17 @@ class MPO_Agent():
         self._update_targets()
         
 
-    def train_agent(self, envs: gym.Env, csv_path: str = "training_log.csv") -> None:
+    def train_agent(self, envs: gym.Env, run_tag: str, log_dir: str = "train_logs") -> None:
+        current_date = datetime.now().strftime("%Y%m%d-%H%M%S")
+        experiment_folder = os.path.join(log_dir, f"{run_tag}_{current_date}")
+        checkpoints_folder = os.path.join(experiment_folder, "checkpoints")
+        os.makedirs(checkpoints_folder, exist_ok=True)
+
+        with open(os.path.join(experiment_folder, "hyperparams.json"), "w") as f:
+            json.dump(self.cfg, f, indent=2)
+
         self._train()
-        obs, _ = envs.reset()
+        obs, _ = envs.reset(seed=self.cfg.get('environment', {}).get('seed', 42))
 
         episode_returns = torch.zeros(self.n_envs, device=self.device)
         episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=self.device)
@@ -575,12 +590,40 @@ class MPO_Agent():
 
             if step >= self.learning_starts:
                 self.update()
-                # if step == self.learning_starts + 5:
-                #     quit()
+            
+            current_interaction = step * self.n_envs
+            if current_interaction % self.save_checkpoint_rate == 0:
+                self.save_checkpoint(current_interaction, checkpoints_folder)
 
         envs.close()
+        csv_path = os.path.join(experiment_folder, "performance.csv")
         pd.DataFrame(log_rows).to_csv(csv_path, index=False)
         print(f"[INFO]: Training log saved to {csv_path}")
+
+    def save_checkpoint(self, current_env_interaction: int, folder:str) -> None:
+        checkpoint = {
+            "policy": self.policy.state_dict(),
+            "target_policy": self.target_policy.state_dict(),
+            "critic": self.critic.state_dict(),
+            "target_critic": self.target_critic.state_dict(),
+
+            "policy_optimizer": self.policy.optimizer.state_dict(),
+            "critic_optimizer": self.critic.optimizer.state_dict(),
+
+            "log_eta": self.log_eta.data,
+            "log_alpha_mu": self.log_alpha_mu.data,
+            "log_alpha_sigma": self.log_alpha_sigma.data,
+
+            "dual_temp_optimizer": self.dual_temp_optimizer.state_dict(),
+            "dual_kl_mu_optimizer": self.dual_kl_mu_optimizer.state_dict(),
+            "dual_kl_sigma_optimizer": self.dual_kl_sigma_optimizer.state_dict(),
+
+            "global_step": current_env_interaction,
+
+            # "torch_rng_state": torch.random.get_rng_state(),
+            # "numpy_rng_state": np.random.get_state(),
+        }
+        torch.save(checkpoint, os.path.join(folder, f"checkpoint_{current_env_interaction}.pth"))
 
 
 def main():
@@ -594,8 +637,18 @@ def main():
     cfg['environment']['act_dim'] = env.action_space.shape[-1]
     cfg['environment']['act_lim'] = [env.action_space.low.item(), env.action_space.high.item()]
 
+    seed = cfg['environment'].get('seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     agent = MPO_Agent(cfg=cfg)
-    agent.train_agent(env, 'train_logs_layernorm.csv')
+    log_dir = os.path.join(cwd, "train_logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    agent.train_agent(env, args.run_name, log_dir)
         
     
 if __name__ == "__main__":

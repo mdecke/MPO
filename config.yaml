@@ -1,6 +1,7 @@
 environment: 
   seed : 42
   device : cpu
+  reward_scale : 0.1
 
 agent :
   policy :
@@ -17,7 +18,6 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    distributional : false
   
   params:
     gamma : 0.99
@@ -38,4 +38,4 @@ training :
   max_interactions : 200000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 5000
-  reward_scale : 0.1
+  save_checkpoint_rate : 500
