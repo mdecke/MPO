@@ -38,3 +38,4 @@ training :
   max_interactions : 200000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 5000
+  reward_scale : 0.1
