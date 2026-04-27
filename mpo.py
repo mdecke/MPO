@@ -21,12 +21,9 @@ import time
 parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
-parser.add_argument('--max_interactions', type=int, default=200000, help="number of total steps across envs")
+parser.add_argument('--max_interactions', type=int, default=100000, help="number of total steps across envs")
 parser.add_argument('--distributional', action='store_true', help="use distributional Q-learning (QR-DQN style)")
-parser.add_argument('--ensemble', action='store_true',help='multiple q functions learned and avged' )
 args = parser.parse_args()
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 ACTIVATION_FCTS = {
     'relu' : nn.ReLU,
@@ -60,8 +57,7 @@ def load_config(config_dict_path:str, args) -> Dict:
         'task':             ('environment', 'task'),
         'n_envs':           ('environment', 'n_envs'),
         'max_interactions': ('training', 'max_interactions'),
-        'distributional':   ('agent', 'critic', 'distributional'),
-        'ensemble':   ('agent', 'critic', 'ensemble'),
+        'distributional':   ('agent', 'critic', 'distributional')
     }
 
     for arg_name, yaml_path in cli_to_yaml.items():
@@ -100,13 +96,13 @@ class Buffer:
             act_shape = tuple(self.act_dim)
 
         # Sequence of Arrays (SoA) --> each variable is stored in a (N by #_envs) tensor
-        self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=device)
-        self.next_obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=device)
-        self.actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=device)
-        self.rewards = torch.empty((self.N, self.envs, 1), dtype=torch.float32, device=device)
-        self.truncation = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=device)
-        self.termination = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=device)
-        self.infos = torch.empty((self.N, self.envs), dtype=torch.bool, device=device)
+        self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
+        self.next_obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
+        self.actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
+        self.rewards = torch.empty((self.N, self.envs, 1), dtype=torch.float32, device=self.device)
+        self.truncation = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
+        self.termination = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
+        self.infos = torch.empty((self.N, self.envs), dtype=torch.bool, device=self.device)
         
         self.env_steps = 0
         self.filled_lines = 0
@@ -229,7 +225,9 @@ class Actor(nn.Module):
         raw_acts = distribution.rsample((n_samples,)).permute(1, 0, 2)  # shape: (batch, n_samples, act_dim)
         scaled_acts = torch.tanh(raw_acts)
         actions = scaled_acts * self.action_scale + self.action_bias
-        log_probs = distribution.log_prob(raw_acts)
+        # log_probs = distribution.log_prob(raw_acts)
+        expanded_dist = dist.Normal(distribution.loc.unsqueeze(1), distribution.scale.unsqueeze(1))
+        log_probs = expanded_dist.log_prob(raw_acts)
         log_probs -= torch.log(self.action_scale * (1 - scaled_acts.pow(2)) + 1e-6)
         log_probs = log_probs.sum(2, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
@@ -275,6 +273,7 @@ class MPO_Agent():
         self.act_dim = self.cfg.get('environment',{}).get('act_dim')
         self.act_lim = self.cfg.get('environment',{}).get('act_lim', 1.0)
         self.n_envs = self.cfg.get('environment',{}).get('n_envs')
+        self.device = self.cfg.get('environment',{}).get('device', 'cpu')
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
@@ -297,7 +296,6 @@ class MPO_Agent():
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
         self.distributional = self.cfg.get('agent',{}).get('critic',{}).get('distributional', False)
-        self.ensemble = self.cfg.get('agent',{}).get('critic',{}).get('ensemble', False)
         
 
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
@@ -313,16 +311,16 @@ class MPO_Agent():
         self._init_models()
 
         #dual pb init:
-        self.log_eta = torch.tensor(1.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.log_eta = torch.tensor(1.0, dtype=torch.float32, device=self.device, requires_grad=True)
         self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=1e-2)
 
-        self.log_alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.log_alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
         self.dual_kl_mu_optimizer = optim.Adam([self.log_alpha_mu], lr=1e-2)
 
-        self.log_alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        self.log_alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
         self.dual_kl_sigma_optimizer = optim.Adam([self.log_alpha_sigma], lr=1e-2)
 
-        self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=device)
+        self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=self.device)
 
         self.critic_loss = []
         self.policy_loss = []
@@ -361,6 +359,13 @@ class MPO_Agent():
             p.requires_grad = False
         
         print("[INFO]: Models initialized")
+
+        self.policy = torch.compile(self.policy)
+        self.critic = torch.compile(self.critic)
+        self.target_policy = torch.compile(self.target_policy)
+        self.target_critic = torch.compile(self.target_critic)
+
+        print("[INFO]: Models compiled")
 
     def _train(self) -> None:
         self.policy.train()
@@ -419,7 +424,7 @@ class MPO_Agent():
         return eta_star, weights
 
     def solve_kl_dual(self, kl_value: torch.Tensor, epsilon: float, n_dual_steps: int = 30) -> torch.Tensor:
-        log_alpha = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        log_alpha = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
         dual_optimizer = optim.Adam([log_alpha], lr=1e-2)
         kl = kl_value.detach()
 
@@ -454,12 +459,11 @@ class MPO_Agent():
                sampled_actions: torch.Tensor,
                weights: torch.Tensor) -> None:
         # Weighted NLL (supervised fit to E-step distribution)
-        obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1)
-        log_probs = self.policy.forward(obs_exp).log_prob(sampled_actions)  # (batch_sz, policy_samples, act_dim)
+        curr_d = self.policy.forward(obs)
+        log_probs = dist.Normal(curr_d.loc.unsqueeze(1), curr_d.scale.unsqueeze(1)).log_prob(sampled_actions)  # (batch_sz, policy_samples, act_dim)
         nll = -(weights.detach() * log_probs.sum(-1)).sum(-1).mean()
 
         # Decoupled KL constraints
-        curr_d = self.policy.forward(obs)
         old_d = self.target_policy.forward(obs)
         mu_old, sigma_old = old_d.loc.detach(), old_d.scale.detach()
 
@@ -523,24 +527,24 @@ class MPO_Agent():
         self._train()
         obs, _ = envs.reset()
 
-        episode_returns = torch.zeros(self.n_envs, device=device)
-        episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=device)
+        episode_returns = torch.zeros(self.n_envs, device=self.device)
+        episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=self.device)
 
         log_rows = []
 
         progress_bar = tqdm(range(self.training_steps))
         for step in progress_bar:
             with torch.no_grad():
-                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 action_t, _, _, _ = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
 
-            reward_t = torch.as_tensor(reward, dtype=torch.float32, device=device)
-            terminated_t = torch.as_tensor(terminated, dtype=torch.bool, device=device)
-            truncated_t = torch.as_tensor(truncated, dtype=torch.bool, device=device)
-            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+            reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
+            terminated_t = torch.as_tensor(terminated, dtype=torch.bool, device=self.device)
+            truncated_t = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
+            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
 
             self.buffer.add_sample(obs_t, action_t, next_obs_t, reward_t, truncated_t, terminated_t)
             obs = next_obs
@@ -584,6 +588,7 @@ def main():
     cwd = os.getcwd()
     config_path = os.path.join(cwd, 'config.yaml')
     cfg = load_config(config_path, args)
+    cfg['environment']['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
     cfg['environment']['obs_dim'] = env.observation_space.shape[-1]
     cfg['environment']['act_dim'] = env.action_space.shape[-1]
     cfg['environment']['act_lim'] = [env.action_space.low.item(), env.action_space.high.item()]
