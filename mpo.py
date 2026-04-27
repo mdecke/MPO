@@ -22,6 +22,8 @@ parser = argparse.ArgumentParser(description="MPO experiment setup")
 parser.add_argument("--task", type=str, default='Pendulum-v1', )
 parser.add_argument("--n_envs", type=int, default=1, help="number of parallel envs")
 parser.add_argument('--max_interactions', type=int, default=200000, help="number of total steps across envs")
+parser.add_argument('--distributional', action='store_true', help="use distributional Q-learning (QR-DQN style)")
+parser.add_argument('--ensemble', action='store_true',help='multiple q functions learned and avged' )
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -57,7 +59,9 @@ def load_config(config_dict_path:str, args) -> Dict:
     cli_to_yaml = {
         'task':             ('environment', 'task'),
         'n_envs':           ('environment', 'n_envs'),
-        'max_interactions':  ('training', 'max_interactions'),
+        'max_interactions': ('training', 'max_interactions'),
+        'distributional':   ('agent', 'critic', 'distributional'),
+        'ensemble':   ('agent', 'critic', 'ensemble'),
     }
 
     for arg_name, yaml_path in cli_to_yaml.items():
@@ -166,7 +170,7 @@ class Actor(nn.Module):
     def __init__(self,
                  input_dim:int,
                  output_dim:int,
-                 action_limit:float,
+                 action_limit:List[float],
                  hidden_dims:List[int],
                  lr:float,
                  activation_fct:str,
@@ -178,6 +182,22 @@ class Actor(nn.Module):
         self.output_dim = output_dim
         self.lr = lr
         self.action_limit = action_limit
+
+        # Action rescaling.
+        self.register_buffer(
+            "action_scale",
+            torch.tensor(
+                (action_limit[1] - action_limit[0]) / 2.0,
+                dtype=torch.float32,
+            ),
+        )
+        self.register_buffer(
+            "action_bias",
+            torch.tensor(
+                (action_limit[1] + action_limit[0]) / 2.0,
+                dtype=torch.float32,
+            ),
+        )
 
         layers = []
         prev_dim = self.input_dim
@@ -203,22 +223,17 @@ class Actor(nn.Module):
         sigma = torch.exp(log_sigma) + 1e-6
         return dist.Normal(mu, sigma)
 
-    def get_action(self, obs: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.forward(obs).mean) * self.action_limit
-
-    def sample(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        d = self.forward(obs)
-        # expand for n_samples: (batch, n_samples, act_dim)
-        raw = d.rsample((n_samples,)).permute(1, 0, 2)  # pre-tanh
-        log_probs = d.log_prob(raw.permute(1, 0, 2)).permute(1, 0, 2)
-        bounded = torch.tanh(raw) * self.action_limit
-        if n_samples == 1:
-            raw = raw.squeeze(1)
-            bounded = bounded.squeeze(1)
-        return bounded, raw, log_probs
-
-    def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.forward(obs).log_prob(actions)
+    def get_action(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        distribution = self.forward(obs)
+        mean = distribution.mean
+        raw_acts = distribution.rsample((n_samples,)).permute(1, 0, 2)  # shape: (batch, n_samples, act_dim)
+        scaled_acts = torch.tanh(raw_acts)
+        actions = scaled_acts * self.action_scale + self.action_bias
+        log_probs = distribution.log_prob(raw_acts)
+        log_probs -= torch.log(self.action_scale * (1 - scaled_acts.pow(2)) + 1e-6)
+        log_probs = log_probs.sum(2, keepdim=True)
+        mean = torch.tanh(mean) * self.action_scale + self.action_bias
+        return actions, log_probs, mean, raw_acts
 
 class Critic(nn.Module):
     def __init__(self,
@@ -281,6 +296,9 @@ class MPO_Agent():
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
+        self.distributional = self.cfg.get('agent',{}).get('critic',{}).get('distributional', False)
+        self.ensemble = self.cfg.get('agent',{}).get('critic',{}).get('ensemble', False)
+        
 
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
@@ -323,6 +341,7 @@ class MPO_Agent():
                             lr=self.policy_lr,
                             activation_fct=self.policy_actv_fct,
                             layer_norm=self.policy_layer_norm)
+        
         self.critic = Critic(input_dim=self.obs_dim+self.act_dim,
                              hidden_dims=self.critic_layers,
                              lr=self.critic_lr,
@@ -357,7 +376,8 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        next_action, _, _ = self.target_policy.sample(obs=batch_data["next_obs"][:,-1,:])
+        next_action, _, _, _ = self.target_policy.get_action(obs=batch_data["next_obs"][:,-1,:])
+        next_action = next_action.squeeze(1)
         q_target = self.target_critic.forward(state=batch_data['next_obs'][:,-1,:], action=next_action)
 
         #temporal diff
@@ -417,7 +437,7 @@ class MPO_Agent():
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
 
-        bounded_actions, raw_actions, _ = self.target_policy.sample(obs, n_samples=self.policy_samples)
+        bounded_actions, _, _, raw_actions = self.target_policy.get_action(obs, n_samples=self.policy_samples)
 
         # Expand obs and flatten bounded actions for critic (critic trained on post-tanh actions)
         obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
@@ -435,7 +455,7 @@ class MPO_Agent():
                weights: torch.Tensor) -> None:
         # Weighted NLL (supervised fit to E-step distribution)
         obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1)
-        log_probs = self.policy.log_prob(obs_exp, sampled_actions)  # (batch_sz, policy_samples, act_dim)
+        log_probs = self.policy.forward(obs_exp).log_prob(sampled_actions)  # (batch_sz, policy_samples, act_dim)
         nll = -(weights.detach() * log_probs.sum(-1)).sum(-1).mean()
 
         # Decoupled KL constraints
@@ -512,7 +532,8 @@ class MPO_Agent():
         for step in progress_bar:
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                action_t, _, _ = self.policy.sample(obs_t)
+                action_t, _, _, _ = self.policy.get_action(obs_t)
+                action_t = action_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
 
@@ -565,10 +586,10 @@ def main():
     cfg = load_config(config_path, args)
     cfg['environment']['obs_dim'] = env.observation_space.shape[-1]
     cfg['environment']['act_dim'] = env.action_space.shape[-1]
-    cfg['environment']['act_lim'] = env.action_space.high.flat[0]  # assume symmetric limits [-a, a]
+    cfg['environment']['act_lim'] = [env.action_space.low.item(), env.action_space.high.item()]
 
     agent = MPO_Agent(cfg=cfg)
-    agent.train_agent(env)
+    agent.train_agent(env, 'train_logs_layernorm.csv')
         
     
 if __name__ == "__main__":
