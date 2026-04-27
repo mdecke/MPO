@@ -9,21 +9,24 @@ parser.add_argument("--smooth", type=int, default=10, help="rolling window size 
 args = parser.parse_args()
 
 logs_dir = os.path.join(os.getcwd(), args.logs_dir)
-csv_files = sorted(f for f in os.listdir(logs_dir) if f.endswith(".csv"))
+run_dirs = sorted(
+    d for d in os.listdir(logs_dir)
+    if os.path.isdir(os.path.join(logs_dir, d))
+    and os.path.isfile(os.path.join(logs_dir, d, "performance.csv"))
+)
 
-if not csv_files:
-    print(f"No CSV files found in {logs_dir}")
+if not run_dirs:
+    print(f"No run folders with performance.csv found in {logs_dir}")
     exit(1)
 
 plt.figure(figsize=(10, 5))
 
-for fname in csv_files:
-    df = pd.read_csv(os.path.join(logs_dir, fname))
+for run in run_dirs:
+    df = pd.read_csv(os.path.join(logs_dir, run, "performance.csv"))
     returns = df["mean_return"]
     if args.smooth > 1:
         returns = returns.rolling(args.smooth, min_periods=1).mean()
-    label = os.path.splitext(fname)[0]
-    plt.plot(df["timestep"], returns, label=label)
+    plt.plot(df["timestep"], returns, label=run)
 
 plt.xlabel("Environment interactions")
 plt.ylabel("Mean return")
