@@ -7,7 +7,7 @@ agent :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'tanh'
-    layer_norm : false
+    layer_norm : true
     gradient_clip : 5.0
     update_delay : 10
 
@@ -15,8 +15,11 @@ agent :
     hidden_layers : [128, 64, 64]
     lr : 0.0001
     act_fct : 'elu'
-    layer_norm : false
+    layer_norm : true
     gradient_clip : 5.0
+    distributional : false
+    n_atoms : 51
+    ensemble : false
   
   params:
     gamma : 0.99
