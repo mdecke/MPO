@@ -302,6 +302,7 @@ class MPO_Agent():
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
+        self.reward_scale = self.cfg.get('training',{}).get('reward_scale', 1.0)
 
         self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
         self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
@@ -546,10 +547,10 @@ class MPO_Agent():
             truncated_t = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
             next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
 
-            self.buffer.add_sample(obs_t, action_t, next_obs_t, reward_t, truncated_t, terminated_t)
-            obs = next_obs
-
             episode_returns += reward_t
+
+            self.buffer.add_sample(obs_t, action_t, next_obs_t, reward_t * self.reward_scale, truncated_t, terminated_t)
+            obs = next_obs
             episode_lengths += 1
 
             done = terminated_t | truncated_t
