@@ -305,6 +305,7 @@ class MPO_Agent():
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
         self.n_critics = self.cfg.get('agent',{}).get('critic',{}).get('ensemble',1)
+        self.p_bootstrap = self.cfg.get('agent', {}).get('critic', {}).get('bootstrap_p', 0.9)
         
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
@@ -383,20 +384,28 @@ class MPO_Agent():
     def _train(self) -> None:
         self.policy.train()
         self.target_policy.train()
-        self.critic.train()
-        self.target_critic.train()
+        for q, target_q in zip(self.q_functions, self.target_qs):
+            q.train()
+            target_q.train()
+        
     
     def _eval(self) -> None:
         self.policy.eval()
         self.target_policy.eval()
-        self.critic.eval()
-        self.target_critic.eval()
+        for q, target_q in zip(self.q_functions, self.target_qs):
+            q.eval()
+            target_q.eval()
+        
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
         next_action, _, _, _ = self.target_policy.get_action(obs=batch_data["next_obs"][:,-1,:])
         next_action = next_action.squeeze(1)
-        q_target = self.target_critic.forward(state=batch_data['next_obs'][:,-1,:], action=next_action)
+        q_target = self.aggregation_operator(state=batch_data['next_obs'][:,-1,:],
+                                             action=next_action,
+                                             critics=self.target_qs,
+                                             mode='min_subset',
+                                             subset_size=2)
 
         #temporal diff
         y = q_target
@@ -404,22 +413,56 @@ class MPO_Agent():
             termination = batch_data['term'][:,k,:]
             reward =batch_data['r'][:,k,:]
             y = reward + self.gamma * (~termination) * y
-        
-        q_value = self.critic.forward(state=batch_data['obs'][:,-1,:], action=batch_data['acts'][:,-1,:])
-        self.mean_q_value.append(q_value.mean().item())
 
-        critic_loss = F.mse_loss(q_value, y)
-        self.critic.optimizer.zero_grad()
-        critic_loss.backward()
-        
-        if self.critic_gradient_clipping:
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_gradient_clipping)
-        
-        self.critic.optimizer.step()
-        self.critic_loss.append(critic_loss.item())
+        masks = torch.bernoulli(torch.full(size=(self.batch_sz,self.n_critics), fill_value=1), p=self.p_bootstrap).bool() #bootstrap over batch and ensemble member: different q functions see different transitions
+        losses_this_step = []
+        for k,q in enumerate(self.q_functions):
+            m = masks[:,k]
+            if m.sum() == 0:
+                continue #safeguard: if all mask over data is all 0
 
-    def aggregation_operator(self):
-        pass
+            q_value = q.forward(state=batch_data['obs'][m,-1,:], action=batch_data['acts'][m,-1,:])
+            critic_loss = F.mse_loss(q_value, y[m])
+            
+            q.optimizer.zero_grad()
+            critic_loss.backward()
+            if self.critic_gradient_clipping:
+                nn.utils.clip_grad_norm_(q.parameters(), self.critic_gradient_clipping)
+            q.optimizer.step()
+
+            losses_this_step.append(critic_loss.item())
+
+        # ---- Logging ----
+        if losses_this_step:
+            self.critic_loss.append(float(np.mean(losses_this_step)))
+
+        with torch.no_grad():
+            q_mean_diag = self.aggregation_operator(
+                state=batch_data['obs'][m,-1,:], action=batch_data['acts'][m,-1,:], critics=self.q_functions, mode='mean'
+            )
+            self.mean_q_value.append(q_mean_diag.mean().item())
+
+    def aggregation_operator(self,
+                             state:torch.Tensor,
+                             action: torch.Tensor,
+                             critics:nn.ModuleList,
+                             mode:str='mean',
+                             beta:float=1.0,
+                             subset_size:int=2) -> torch.Tensor:
+        next_q_values = torch.stack([q.forward(state,action) for q in critics],dim=0) #shape: (n_critis x batch_sz x output_dim)
+        if mode == "mean":
+            return next_q_values.mean(dim=0) #mean across ensemble dim
+        elif mode == "LCB":
+            return next_q_values.mean(dim=0) - beta*(next_q_values.std(dim=0) + 1e-6) #safeguard for collapsing std
+        elif mode == "UCB":
+            return next_q_values.mean(dim=0) + beta*(next_q_values.std(dim=0) + 1e-6)
+        elif mode == "min_subset":
+            idx = torch.randperm(next_q_values.shape[0], device=self.device)[:subset_size]
+            return next_q_values[idx].min(dim=0).values
+        elif mode == "median":
+            return next_q_values.median(dim=0).values
+        else:
+            raise ValueError(f"Unknown aggregation method: {mode}")
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
@@ -612,11 +655,11 @@ class MPO_Agent():
         checkpoint = {
             "policy": self.policy.state_dict(),
             "target_policy": self.target_policy.state_dict(),
-            "critic": self.critic.state_dict(),
-            "target_critic": self.target_critic.state_dict(),
-
             "policy_optimizer": self.policy.optimizer.state_dict(),
-            "critic_optimizer": self.critic.optimizer.state_dict(),
+
+            "q_functions": [q.state_dict() for q in self.q_functions],
+            "target_qs":   [q.state_dict() for q in self.target_qs],
+            "q_optimizers": [q.optimizer.state_dict() for q in self.q_functions],
 
             "log_eta": self.log_eta.data,
             "log_alpha_mu": self.log_alpha_mu.data,
@@ -627,6 +670,7 @@ class MPO_Agent():
             "dual_kl_sigma_optimizer": self.dual_kl_sigma_optimizer.state_dict(),
 
             "global_step": current_env_interaction,
+            "n_critics" : self.n_critics,
 
             # "torch_rng_state": torch.random.get_rng_state(),
             # "numpy_rng_state": np.random.get_state(),
