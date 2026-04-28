@@ -18,6 +18,8 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
+    ensemble : 3
+    bootstrap_p : 0.9
   
   params:
     gamma : 0.99
