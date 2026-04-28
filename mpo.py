@@ -507,7 +507,8 @@ class MPO_Agent():
         obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
         acts_flat = bounded_actions.reshape(-1, bounded_actions.shape[-1])
 
-        self.evaluted_q = self.target_critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
+        # self.evaluted_q = self.target_critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
+        self.evaluted_q = self.aggregation_operator(state=obs_exp, action=acts_flat, critics=self.target_qs, mode='mean')
 
         eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
 
