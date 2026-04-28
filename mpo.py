@@ -562,7 +562,8 @@ class MPO_Agent():
     def _update_targets(self) -> None:
         for p, p_tgt in zip(self.policy.parameters(), self.target_policy.parameters()):
             p_tgt.data.lerp_(p.data, 1 - self.tau)
-        for p, p_tgt in zip(self.critic.parameters(), self.target_critic.parameters()):
+
+        for p, p_tgt in zip(self.q_functions.parameters(), self.target_qs.parameters()):
             p_tgt.data.lerp_(p.data, 1 - self.tau)
 
     def update(self) -> None:
