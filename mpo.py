@@ -29,6 +29,7 @@ parser.add_argument('--max_interactions', type=int, default=100000, help="number
 parser.add_argument('--save_checkpoint_rate', type=int, default=500, help="rate of env interactions at which the models are saved")
 parser.add_argument('--save_buffer', action='store_true', help='flag to store replay buffer')
 parser.add_argument('--seed', type=int, default=42, help='global random seed (overrides config)')
+parser.add_argument('--ensemble', type=int, default=1, help="number of Q functions")
 args = parser.parse_args()
 
 ACTIVATION_FCTS = {
@@ -64,6 +65,7 @@ def load_config(config_dict_path:str, args) -> Dict:
         'save_checkpoint_rate': ('training', 'save_checkpoint_rate'),
         'save_buffer': ('buffer', 'save_buffer'),
         'seed':        ('environment', 'seed'),
+        'ensemble' : ('agent', 'critic', 'ensemble')
     }
 
     for arg_name, yaml_path in cli_to_yaml.items():
@@ -302,8 +304,8 @@ class MPO_Agent():
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
+        self.n_critics = self.cfg.get('agent',{}).get('critic',{}).get('ensemble',1)
         
-
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
@@ -340,38 +342,41 @@ class MPO_Agent():
         print("[INFO]: Memory class initialized")
 
     def _init_models(self) -> None:
+        #--- Policy ----
         self.policy = Actor(input_dim=self.obs_dim,
                             output_dim=self.act_dim,
                             action_limit=self.act_lim,  # Assuming symmetric action bounds
                             hidden_dims=self.policy_layers,
                             lr=self.policy_lr,
                             activation_fct=self.policy_actv_fct,
-                            layer_norm=self.policy_layer_norm)
-        
-        self.critic = Critic(input_dim=self.obs_dim+self.act_dim,
-                             hidden_dims=self.critic_layers,
-                             lr=self.critic_lr,
-                             activation_fct=self.critic_actv_fct,
-                             layer_norm=self.critic_layer_norm)
-        
+                            layer_norm=self.policy_layer_norm).to(self.device)
         init_model_weights(self.policy)
-        init_model_weights(self.critic)
 
         self.target_policy = copy.deepcopy(self.policy)
-        self.target_critic = copy.deepcopy(self.critic)
-
         #Targets only updated via polyak interpolation, no need to track grads
         for p in self.target_policy.parameters():
             p.requires_grad = False
-        for p in self.target_critic.parameters():
+        
+        #--- Critic ensemble ---
+        self.q_functions = nn.ModuleList([Critic(input_dim=self.obs_dim + self.act_dim,
+                                                 hidden_dims=self.critic_layers,
+                                                 lr=self.critic_lr,
+                                                 activation_fct=self.critic_actv_fct,
+                                                 layer_norm=self.critic_layer_norm) for _ in range(self.n_critics)]).to(self.device)
+        for q in self.q_functions:
+            init_model_weights(q)
+        
+        self.target_qs = copy.deepcopy(self.q_functions)
+        for p in self.target_qs.parameters():
             p.requires_grad = False
+        
         
         print("[INFO]: Models initialized")
 
         self.policy = torch.compile(self.policy)
-        self.critic = torch.compile(self.critic)
         self.target_policy = torch.compile(self.target_policy)
-        self.target_critic = torch.compile(self.target_critic)
+        self.q_functions = nn.ModuleList([torch.compile(q) for q in self.q_functions])
+        self.target_qs = nn.ModuleList([torch.compile(q) for q in self.target_qs])
 
         print("[INFO]: Models compiled")
 
@@ -412,6 +417,9 @@ class MPO_Agent():
         
         self.critic.optimizer.step()
         self.critic_loss.append(critic_loss.item())
+
+    def aggregation_operator(self):
+        pass
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
