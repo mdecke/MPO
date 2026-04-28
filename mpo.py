@@ -472,7 +472,7 @@ class MPO_Agent():
             for _ in range(n_dual_steps):
                 self.dual_temp_optimizer.zero_grad()
                 eta = self.log_eta.exp()
-                dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(torch.tensor(n_samples))).mean()
+                dual_loss = eta * epsilon + eta * (torch.logsumexp(q_values / eta, dim=-1) - torch.log(torch.tensor(n_samples, device=self.device))).mean()
                 dual_loss.backward()
                 self.dual_temp_optimizer.step()
                 self.log_eta.data.clamp_(-4.0, 4.0)  # keep eta in [~0.02, ~55], prevents q/eta overflow
@@ -508,10 +508,10 @@ class MPO_Agent():
         acts_flat = bounded_actions.reshape(-1, bounded_actions.shape[-1])
 
         # self.evaluted_q = self.target_critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
-        self.evaluted_q = self.aggregation_operator(state=obs_exp, action=acts_flat, critics=self.target_qs, mode='mean')
+        self.evaluted_q = self.aggregation_operator(state=obs_exp, action=acts_flat, critics=self.target_qs, mode='mean').reshape(self.batch_sz, self.policy_samples)
 
         eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
-
+        
         return raw_actions, weights, eta
 
     def m_step(self,
