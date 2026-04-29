@@ -28,7 +28,7 @@ parser.add_argument("--n_envs", type=int, default=1, help="number of parallel en
 parser.add_argument('--max_interactions', type=int, default=100000, help="number of total steps across envs")
 parser.add_argument('--save_checkpoint_rate', type=int, default=500, help="rate of env interactions at which the models are saved")
 parser.add_argument('--save_buffer', action='store_true', help='flag to store replay buffer')
-parser.add_argument('--seed', type=int, default=42, help='global random seed (overrides config)')
+parser.add_argument('--seed', type=int, default=1, help='global random seed (overrides config)')
 parser.add_argument('--ensemble', type=int, default=1, help="number of Q functions")
 args = parser.parse_args()
 
@@ -312,6 +312,7 @@ class MPO_Agent():
         self.warm_up_steps = self.cfg.get('training',{}).get('warm_up', 1_000) #training has started, ramp up LR over these nb of steps -> stable grads
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
         self.save_checkpoint_rate = self.cfg.get('training',{}).get('save_checkpoint_rate', 500)
+        self.utd_ratio = self.cfg.get('training',{}).get('utd_ratio', 1)
 
         self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
         self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
@@ -642,7 +643,8 @@ class MPO_Agent():
                 episode_lengths[done] = 0
 
             if step >= self.learning_starts:
-                self.update()
+                for _ in range(self.utd_ratio):
+                    self.update()
             
             current_interaction = step * self.n_envs
             if current_interaction % self.save_checkpoint_rate == 0:
