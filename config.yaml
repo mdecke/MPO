@@ -1,7 +1,7 @@
 environment: 
   seed : 42
   device : cpu
-  reward_scale : 0.1
+  reward_scale : 10
 
 agent :
   policy :
@@ -10,7 +10,7 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    update_delay : 10
+    update_delay : 0.1
 
   critic :
     hidden_layers : [128, 64, 64]
@@ -41,3 +41,4 @@ training :
   warm_up : 1000  # Fill buffer before training
   learning_starts : 5000
   save_checkpoint_rate : 500
+  utd_ratio : 3
