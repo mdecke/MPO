@@ -34,11 +34,12 @@ agent :
 buffer :
   batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
-  td_horizon : 1
+  td_horizon : 3
 
 training :
   max_interactions : 200000
   warm_up : 1000  # Fill buffer before training
-  learning_starts : 5000
+  learning_starts : 3000
   save_checkpoint_rate : 500
   utd_ratio : 3
+  policy_learning_starts : 2000 #after learning starts
