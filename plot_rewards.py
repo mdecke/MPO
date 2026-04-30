@@ -39,7 +39,7 @@ plt.hlines(0, xmin=0, xmax=params_dict['training']['max_interactions'], colors='
 plt.xlabel("Environment interactions")
 plt.ylabel("Mean return")
 plt.title("Training return")
-plt.legend()
+plt.legend(ncols=2, fontsize='x-small')
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('rewards.pdf')
