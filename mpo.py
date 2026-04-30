@@ -313,6 +313,7 @@ class MPO_Agent():
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
         self.save_checkpoint_rate = self.cfg.get('training',{}).get('save_checkpoint_rate', 500)
         self.utd_ratio = self.cfg.get('training',{}).get('utd_ratio', 1)
+        self.policy_learning_start = self.cfg.get('training',{}).get('policy_learning_start', 0)
 
         self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
         self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
@@ -560,28 +561,30 @@ class MPO_Agent():
         self.policy.optimizer.step()
         self.policy_loss.append(policy_loss.item())
 
-    def _update_targets(self) -> None:
-        for p, p_tgt in zip(self.policy.parameters(), self.target_policy.parameters()):
-            p_tgt.data.lerp_(p.data, 1 - self.tau)
+    def _update_targets(self, critic_only:bool=False) -> None:
+        if not critic_only:
+            for p, p_tgt in zip(self.policy.parameters(), self.target_policy.parameters()):
+                p_tgt.data.lerp_(p.data, 1 - self.tau)
 
         for p, p_tgt in zip(self.q_functions.parameters(), self.target_qs.parameters()):
             p_tgt.data.lerp_(p.data, 1 - self.tau)
 
-    def update(self) -> None:
+    def update(self, critic_only:bool=False) -> None:
         batch = self.buffer.sample(self.batch_sz, self.td_horizon)
         # t_0_critic = time.perf_counter()
         self.update_critic(batch)
         # print(f"critic update duration: {time.perf_counter() - t_0_critic}")
-
-        obs = batch['obs'][:, -1, :]
-        with torch.no_grad():
-            # t_0_e_step = time.perf_counter()
-            sampled_actions, weights, _ = self.e_step(batch)
-            # print(f"e-step duration: {time.perf_counter() - t_0_e_step}")
-            
-        # t_0_m_step = time.perf_counter()
-        self.m_step(obs, sampled_actions, weights)
-        # print(f"m-step duration: {time.perf_counter() - t_0_m_step}")
+        
+        if not critic_only:
+            obs = batch['obs'][:, -1, :]
+            with torch.no_grad():
+                # t_0_e_step = time.perf_counter()
+                sampled_actions, weights, _ = self.e_step(batch)
+                # print(f"e-step duration: {time.perf_counter() - t_0_e_step}")
+                
+            # t_0_m_step = time.perf_counter()
+            self.m_step(obs, sampled_actions, weights)
+            # print(f"m-step duration: {time.perf_counter() - t_0_m_step}")
         self._update_targets()
         
 
@@ -601,6 +604,7 @@ class MPO_Agent():
         episode_lengths = torch.zeros(self.n_envs, dtype=torch.int32, device=self.device)
 
         log_rows = []
+        critic_only = True
 
         progress_bar = tqdm(range(self.training_steps))
         for step in progress_bar:
@@ -641,10 +645,12 @@ class MPO_Agent():
                 })
                 episode_returns[done] = 0.0
                 episode_lengths[done] = 0
-
+            if step >= (self.learning_starts + self.policy_learning_start):
+                critic_only = False
+            
             if step >= self.learning_starts:
                 for _ in range(self.utd_ratio):
-                    self.update()
+                    self.update(critic_only)
             
             current_interaction = step * self.n_envs
             if current_interaction % self.save_checkpoint_rate == 0:
