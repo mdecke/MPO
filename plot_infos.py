@@ -20,6 +20,14 @@ def arg_parser():
 
 
 _DT_PATTERN = re.compile(r'(\d{8}-\d{6})')
+DUAL_LINESTYLES = {
+    'eta':        '-',
+    'kl_mu':      '--',
+    'kl_sigma':   '-.',
+    'alpha_mu':   ':',
+    'alpha_sigma': (0, (3, 1, 1, 1, 1, 1)),
+}
+
 
 def run_datetime(name):
     m = _DT_PATTERN.search(name)
@@ -136,9 +144,10 @@ def main():
                                   'log_eta', 'log_alpha_mu', 'log_alpha_sigma']
                      if c in df.columns]
         for col in dual_cols:
+            ls  = DUAL_LINESTYLES[col]
             lbl = f'{col} ({run_name})' if len(runs) > 1 else col
             ax_dual.plot(df['timestep'], df[col],
-                         color=color, alpha=alpha, lw=lw, label=lbl)
+                         color=color, alpha=alpha, lw=lw, label=lbl, linestyle=ls)
             dual_cols_seen.add(col)
 
     # --- decorations ---
