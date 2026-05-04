@@ -313,7 +313,7 @@ class MPO_Agent():
         self.learning_starts = self.cfg.get('training',{}).get('learning_starts', 10_000) #don't take any gradient for these first n steps
         self.save_checkpoint_rate = self.cfg.get('training',{}).get('save_checkpoint_rate', 500)
         self.utd_ratio = self.cfg.get('training',{}).get('utd_ratio', 1)
-        self.policy_learning_start = self.cfg.get('training',{}).get('policy_learning_start', 0)
+        self.policy_learning_starts = self.cfg.get('training',{}).get('policy_learning_starts', 0)
 
         self.buffer_sz = self.cfg.get('buffer', {}).get('buffer_size', 1_000_000)
         self.batch_sz = self.cfg.get('buffer', {}).get('batch_size', 256)
@@ -327,11 +327,13 @@ class MPO_Agent():
         self.log_eta = torch.tensor(1.0, dtype=torch.float32, device=self.device, requires_grad=True)
         self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=1e-2)
 
-        self.log_alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
-        self.dual_kl_mu_optimizer = optim.Adam([self.log_alpha_mu], lr=1e-2)
+        # self.log_alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
+        self.alpha_mu = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=False)
+        # self.dual_kl_mu_optimizer = optim.Adam([self.log_alpha_mu], lr=1e-2)
 
-        self.log_alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
-        self.dual_kl_sigma_optimizer = optim.Adam([self.log_alpha_sigma], lr=1e-2)
+        # self.log_alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
+        self.alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=False)
+        # self.dual_kl_sigma_optimizer = optim.Adam([self.log_alpha_sigma], lr=1e-2)
 
         self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=self.device)
 
@@ -545,12 +547,12 @@ class MPO_Agent():
         # alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
 
         # No loop needed
-        alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.0)
-        alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.0)
+        self.alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.1)
+        self.alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.1)
 
         policy_loss = (nll
-                       + alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
-                       + alpha_sigma * (kl_sigma - self.m_step_epsilon_sigma))
+                       + self.alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
+                       + self.alpha_sigma * (kl_sigma - self.m_step_epsilon_sigma))
 
         self.policy.optimizer.zero_grad()
         policy_loss.backward()
@@ -635,23 +637,28 @@ class MPO_Agent():
                     "ep_len": f"{mean_length:.0f}",
                     "step": step,
                 })
+
                 log_rows.append({
                     "timestep": step * self.n_envs,
                     "mean_reward": reward_t[done].mean().item(),
                     "mean_return": mean_return,
-                    "mean_ep_len": mean_length,
+                    "mean_episode_length": mean_length,
                     "policy_loss": self.policy_loss[-1] if self.policy_loss else float("nan"),
                     "critic_loss": self.critic_loss[-1] if self.critic_loss else float("nan"),
+                    "eta": self.log_eta.data.exp(),
+                    "alpha_mu": self.alpha_mu.data,
+                    "alpha_sigma": self.alpha_sigma.data,
                 })
+                
                 episode_returns[done] = 0.0
                 episode_lengths[done] = 0
-            if step >= (self.learning_starts + self.policy_learning_start):
+            if step >= (self.learning_starts + self.policy_learning_starts):
                 critic_only = False
             
             if step >= self.learning_starts:
                 for _ in range(self.utd_ratio):
                     self.update(critic_only)
-            
+
             current_interaction = step * self.n_envs
             if current_interaction % self.save_checkpoint_rate == 0:
                 self.save_checkpoint(current_interaction, checkpoints_folder)
@@ -672,12 +679,12 @@ class MPO_Agent():
             "q_optimizers": [q.optimizer.state_dict() for q in self.q_functions],
 
             "log_eta": self.log_eta.data,
-            "log_alpha_mu": self.log_alpha_mu.data,
-            "log_alpha_sigma": self.log_alpha_sigma.data,
+            "alpha_mu": self.alpha_mu.data,
+            "alpha_sigma": self.alpha_sigma.data,
 
             "dual_temp_optimizer": self.dual_temp_optimizer.state_dict(),
-            "dual_kl_mu_optimizer": self.dual_kl_mu_optimizer.state_dict(),
-            "dual_kl_sigma_optimizer": self.dual_kl_sigma_optimizer.state_dict(),
+            # "dual_kl_mu_optimizer": self.dual_kl_mu_optimizer.state_dict(),
+            # "dual_kl_sigma_optimizer": self.dual_kl_sigma_optimizer.state_dict(),
 
             "global_step": current_env_interaction,
             "n_critics" : self.n_critics,
