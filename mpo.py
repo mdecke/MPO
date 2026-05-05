@@ -283,6 +283,7 @@ class MPO_Agent():
         self.n_envs = self.cfg.get('environment',{}).get('n_envs')
         self.reward_scale = self.cfg.get('training',{}).get('reward_scale', 1.0)
         self.device = self.cfg.get('environment',{}).get('device', 'cpu')
+        self.dt = self.cfg.get('environment',{}).get('dt', 0.1)
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
@@ -416,7 +417,7 @@ class MPO_Agent():
         for k in range(self.td_horizon-1,-1,-1):
             termination = batch_data['term'][:,k,:]
             reward =batch_data['r'][:,k,:]
-            y = reward + self.gamma * (~termination) * y
+            y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
 
         masks = torch.bernoulli(torch.full(size=(self.batch_sz,self.n_critics), fill_value=1), p=self.p_bootstrap).bool() #bootstrap over batch and ensemble member: different q functions see different transitions
         losses_this_step = []
@@ -705,6 +706,7 @@ def main():
     cfg['environment']['obs_dim'] = env.observation_space.shape[-1]
     cfg['environment']['act_dim'] = env.action_space.shape[-1]
     cfg['environment']['act_lim'] = [env.action_space.low.item(), env.action_space.high.item()]
+    cfg['environment']['dt'] = env.unwrapped.envs[0].unwrapped.dt
 
     seed = cfg['environment'].get('seed', 42)
     random.seed(seed)
