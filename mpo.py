@@ -47,12 +47,11 @@ def get_activation(name:str='relu') -> nn.Module:
     return act_f()
 
 def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1) -> None:
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if "weight" in name:
-                nn.init.normal_(param, mean=mean, std=std)
-            elif "bias" in name:
-                nn.init.normal_(param, mean=mean, std=std)
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
 def load_config(config_dict_path:str, args) -> Dict:
     with open(config_dict_path, 'r') as file:
@@ -660,9 +659,17 @@ class MPO_Agent():
                 for _ in range(self.utd_ratio):
                     self.update(critic_only)
 
-            current_interaction = step * self.n_envs
-            if current_interaction % self.save_checkpoint_rate == 0:
+            # current_interaction = step * self.n_envs
+            # if current_interaction % self.save_checkpoint_rate == 0:
+            #     self.save_checkpoint(current_interaction, checkpoints_folder)
+
+            next_checkpoint_at = self.save_checkpoint_rate
+            current_interaction = (step + 1) * self.n_envs
+            if current_interaction >= next_checkpoint_at:
                 self.save_checkpoint(current_interaction, checkpoints_folder)
+                # advance to the next multiple of save_checkpoint_rate beyond current_interaction
+                next_checkpoint_at = ((current_interaction // self.save_checkpoint_rate) + 1) \
+                                    * self.save_checkpoint_rate
 
         envs.close()
         csv_path = os.path.join(experiment_folder, "performance.csv")
