@@ -419,7 +419,7 @@ class MPO_Agent():
             reward =batch_data['r'][:,k,:]
             y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
 
-        masks = torch.bernoulli(torch.full(size=(self.batch_sz,self.n_critics), fill_value=1), p=self.p_bootstrap).bool() #bootstrap over batch and ensemble member: different q functions see different transitions
+        masks = torch.bernoulli(torch.full((self.batch_sz, self.n_critics), self.p_bootstrap, device=self.device)).bool()
         losses_this_step = []
         for k,q in enumerate(self.q_functions):
             m = masks[:,k]
@@ -443,7 +443,7 @@ class MPO_Agent():
 
         with torch.no_grad():
             q_mean_diag = self.aggregation_operator(
-                state=batch_data['obs'][m,-1,:], action=batch_data['acts'][m,-1,:], critics=self.q_functions, mode='mean'
+                state=batch_data['obs'][:,-1,:], action=batch_data['acts'][:,-1,:], critics=self.q_functions, mode='mean'
             )
             self.mean_q_value.append(q_mean_diag.mean().item())
 
@@ -588,7 +588,7 @@ class MPO_Agent():
             # t_0_m_step = time.perf_counter()
             self.m_step(obs, sampled_actions, weights)
             # print(f"m-step duration: {time.perf_counter() - t_0_m_step}")
-        self._update_targets()
+        self._update_targets(critic_only)
         
 
     def train_agent(self, envs: gym.Env, run_tag: str, log_dir: str = "train_logs") -> None:
