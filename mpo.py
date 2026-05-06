@@ -534,13 +534,13 @@ class MPO_Agent():
         # D_KL^μ: sg on sigma_theta — gradients flow only through mu_theta
         kl_mu = dist.kl_divergence(
             dist.Normal(curr_d.loc, curr_d.scale.detach()),
-            dist.Normal(mu_old, sigma_old)
+            dist.Normal(mu_old, curr_d.scale.detach())
         ).sum(-1).mean()
 
         # D_KL^Σ: sg on mu_theta — gradients flow only through sigma_theta
         kl_sigma = dist.kl_divergence(
             dist.Normal(curr_d.loc.detach(), curr_d.scale),
-            dist.Normal(mu_old, sigma_old)
+            dist.Normal(curr_d.loc.detach(), sigma_old)
         ).sum(-1).mean()
 
         # alpha_mu = self.solve_kl_dual(kl_mu, self.m_step_epsilon_mu, self.n_kl_dual_steps)
