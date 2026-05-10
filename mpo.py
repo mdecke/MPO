@@ -2,6 +2,7 @@ import os
 import copy
 import json
 import yaml
+import math
 import random
 import argparse
 from tqdm import tqdm
@@ -238,11 +239,14 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return actions, log_probs, mean, raw_acts
 
-#TODO: modify critic to be a distribution
+#TODO: modify critic to be IQN 
 class Critic(nn.Module):
     def __init__(self,
                  input_dim:int,
-                 hidden_dims:List[int],
+                 base_layers:List[int],
+                 head_layers:List[int],
+                 hidden_dim:int,
+                 embedding_dim: int,
                  lr:float,
                  activation_fct:str,
                  layer_norm:bool=False,
@@ -250,26 +254,51 @@ class Critic(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
         self.lr = lr
 
         layers = []
         prev_dim = self.input_dim
 
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
+        for layer_dim in base_layers+ [hidden_dim]:#[128,64,64,hidden_dim]
+            layers.append(nn.Linear(prev_dim, layer_dim))
             if layer_norm:
-                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.LayerNorm(layer_dim))
             layers.append(get_activation(activation_fct))
-            prev_dim = hidden_dim
+            prev_dim = layer_dim
+
+        self.psi = nn.Sequential(*layers) #base network psi:SxA -> R^hidden_dim
+
+        self.cos_weight = nn.Parameter(torch.empty(embedding_dim,hidden_dim))
+        nn.init.xavier_uniform_(self.cos_weight)
+        self.cos_bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.register_buffer('cos_idx', torch.arange(embedding_dim).float()) # index of cosine basis function
+
+        layers = []
+        prev_dim = hidden_dim
+
+        for layer_dim in head_layers:
+            layers.append(nn.Linear(prev_dim, layer_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(layer_dim))
+            layers.append(get_activation(activation_fct))
+            prev_dim = layer_dim
         
-        layers.append(nn.Linear(prev_dim, self.output_dim)) # Q(s,a): R_s x R_a --> R
-        self.net = nn.Sequential(*layers)
+        layers.append(nn.Linear(prev_dim, self.output_dim))
+        self.f_head = nn.Sequential(*layers) # output head f:hidden_dim -> output_dim
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         
-    def forward(self, state:torch.Tensor, action:torch.Tensor) -> torch.Tensor:
-        model_input = torch.cat((state,action), dim=-1)
-        return self.net(model_input)
+    def forward(self, state:torch.Tensor, action:torch.Tensor, tau:torch.Tensor) -> torch.Tensor:
+        B, N = tau.shape
+        sa = torch.cat((state,action), dim=-1)
+        psi_sa = self.psi(sa)                                              # (B, H)
+        cos = torch.cos(math.pi * tau.unsqueeze(-1) * self.cos_idx)                 # (B, N, E)
+        phi = F.relu(cos @ self.cos_weight + self.cos_bias)                      # (B, N, H)
+        h = psi_sa.unsqueeze(1) * phi                                     # (B, N, H)
+        return self.f_head(h).squeeze(-1)            
+        
     
 #TODO: remove ensemble callbacks and implement IQN
 class MPO_Agent():
