@@ -239,7 +239,7 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return actions, log_probs, mean, raw_acts
 
-#TODO: modify critic to be IQN 
+
 class Critic(nn.Module):
     def __init__(self,
                  input_dim:int,
@@ -328,13 +328,19 @@ class MPO_Agent():
         self.policy_layer_norm = self.cfg.get('agent',{}).get('policy',{}).get('layer_norm', False)
         self.policy_gradient_clipping = self.cfg.get('agent',{}).get('policy',{}).get('gradient_clip', None)
 
-        self.critic_layers = self.cfg.get('agent',{}).get('critic',{}).get('hidden_layers',[])
+        self.critic_psi_layers = self.cfg.get('agent',{}).get('critic',{}).get('psi_layers',[])
+        self.critic_f_layers = self.cfg.get('agent',{}).get('critic',{}).get('f_layers', [])
         self.critic_lr = self.cfg.get('agent',{}).get('critic',{}).get('lr', 0.001)
         self.critic_actv_fct = self.cfg.get('agent',{}).get('critic',{}).get('act_fct', 'relu')
         self.critic_layer_norm = self.cfg.get('agent',{}).get('critic',{}).get('layer_norm', False)
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
-        self.n_critics = self.cfg.get('agent',{}).get('critic',{}).get('ensemble',1)
-        self.p_bootstrap = self.cfg.get('agent', {}).get('critic', {}).get('bootstrap_p', 0.9)
+        self.critic_embedding_dim = self.cfg.get('agent',{}).get('critic',{}).get('embedding_dim', None)
+        self.critic_hidden_dim = self.cfg.get('agent',{}).get('critic',{}).get('hidden_dim', None)
+        self.critic_kappa = self.cfg.get('agent',{}).get('critic',{}).get('kappa', None)
+        self.critic_n_quatiles = self.cfg.get('agent',{}).get('critic',{}).get('n_quatiles', 1)
+        self.critic_risk_type = self.cfg.get('agent',{}).get('critic',{}).get('risk', {}).get('beta_type','neutral')
+        self.critic_risk_param = self.cfg.get('agent',{}).get('critic',{}).get('risk', {}).get('beta_param',None)
+
         
         self.interactions = self.cfg.get('training',{}).get('max_interactions', 1_000_000)
         self.training_steps = torch.ceil(torch.tensor(self.interactions/self.n_envs)).int()
@@ -392,16 +398,18 @@ class MPO_Agent():
             p.requires_grad = False
         
         #--- Critic ensemble ---
-        self.q_functions = nn.ModuleList([Critic(input_dim=self.obs_dim + self.act_dim,
-                                                 hidden_dims=self.critic_layers,
-                                                 lr=self.critic_lr,
-                                                 activation_fct=self.critic_actv_fct,
-                                                 layer_norm=self.critic_layer_norm) for _ in range(self.n_critics)]).to(self.device)
-        for q in self.q_functions:
-            init_model_weights(q)
+        self.q_function = Critic(self.obs_dim + self.act_dim,
+                                 self.critic_psi_layers,
+                                 self.critic_f_layers,
+                                 self.critic_hidden_dim,
+                                 self.critic_embedding_dim,
+                                 self.critic_lr,
+                                 self.critic_actv_fct,
+                                 self.critic_layer_norm).to(self.device)
+        init_model_weights(self.q_function)
         
-        self.target_qs = copy.deepcopy(self.q_functions)
-        for p in self.target_qs.parameters():
+        self.target_q = copy.deepcopy(self.q_function)
+        for p in self.target_q.parameters():
             p.requires_grad = False
         
         
@@ -409,8 +417,8 @@ class MPO_Agent():
 
         self.policy = torch.compile(self.policy)
         self.target_policy = torch.compile(self.target_policy)
-        self.q_functions = nn.ModuleList([torch.compile(q) for q in self.q_functions])
-        self.target_qs = nn.ModuleList([torch.compile(q) for q in self.target_qs])
+        self.q_function = torch.compile(self.q_function)
+        self.target_q = torch.compile(self.target_q)
 
         print("[INFO]: Models compiled")
 
