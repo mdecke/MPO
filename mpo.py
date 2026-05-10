@@ -425,17 +425,15 @@ class MPO_Agent():
     def _train(self) -> None:
         self.policy.train()
         self.target_policy.train()
-        for q, target_q in zip(self.q_functions, self.target_qs):
-            q.train()
-            target_q.train()
+        self.q_function.train()
+        self.target_q.train()
         
     
     def _eval(self) -> None:
         self.policy.eval()
         self.target_policy.eval()
-        for q, target_q in zip(self.q_functions, self.target_qs):
-            q.eval()
-            target_q.eval()
+        self.q_function.eval()
+        self.target_q.eval()
         
 
     def update_critic(self,
