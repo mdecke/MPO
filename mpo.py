@@ -29,7 +29,6 @@ parser.add_argument('--max_interactions', type=int, default=100000, help="number
 parser.add_argument('--save_checkpoint_rate', type=int, default=500, help="rate of env interactions at which the models are saved")
 parser.add_argument('--save_buffer', action='store_true', help='flag to store replay buffer')
 parser.add_argument('--seed', type=int, default=1, help='global random seed (overrides config)')
-parser.add_argument('--ensemble', type=int, default=1, help="number of Q functions")
 args = parser.parse_args()
 
 ACTIVATION_FCTS = {
@@ -64,7 +63,6 @@ def load_config(config_dict_path:str, args) -> Dict:
         'save_checkpoint_rate': ('training', 'save_checkpoint_rate'),
         'save_buffer': ('buffer', 'save_buffer'),
         'seed':        ('environment', 'seed'),
-        'ensemble' : ('agent', 'critic', 'ensemble')
     }
 
     for arg_name, yaml_path in cli_to_yaml.items():
@@ -240,6 +238,7 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return actions, log_probs, mean, raw_acts
 
+#TODO: modify critic to be a distribution
 class Critic(nn.Module):
     def __init__(self,
                  input_dim:int,
@@ -272,6 +271,7 @@ class Critic(nn.Module):
         model_input = torch.cat((state,action), dim=-1)
         return self.net(model_input)
     
+#TODO: remove ensemble callbacks and implement IQN
 class MPO_Agent():
     def __init__(self,cfg:Dict):
         self.cfg = cfg

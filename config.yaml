@@ -18,8 +18,11 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    ensemble : 3
-    bootstrap_p : 0.9
+    n_quatiles: 8
+    embedding_dim : 64
+    risk:
+      beta_type : 'neutral' #cvar alternative
+      beta_param : None # or float value for CVAR
   
   params:
     gamma : 0.99
