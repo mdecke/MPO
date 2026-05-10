@@ -53,6 +53,19 @@ def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1) -> None:
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
+def quantile_huber_loss(td_errors: torch.Tensor, tau: torch.Tensor, kappa: float = 1.0) -> torch.Tensor:
+    """
+    td_errors : (B, N_prime, N)  — pairwise differences y[b,n'] - z_pred[b,n]
+    tau       : (B, N)           — quantile levels of z_pred
+    """
+    abs_err = td_errors.abs()
+    huber = torch.where(abs_err <= kappa,
+                        0.5 * td_errors.pow(2),
+                        kappa * (abs_err - 0.5 * kappa))
+    # asymmetric quantile weight: |tau - 1(delta < 0)|
+    tau_w = (tau.unsqueeze(1) - (td_errors.detach() < 0).float()).abs()  # (B, N_prime, N)
+    return (tau_w * huber).sum(dim=2).mean(dim=1).mean()
+
 def load_config(config_dict_path:str, args) -> Dict:
     with open(config_dict_path, 'r') as file:
         config = yaml.safe_load(file)
@@ -370,8 +383,6 @@ class MPO_Agent():
         self.alpha_sigma = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=False)
         # self.dual_kl_sigma_optimizer = optim.Adam([self.log_alpha_sigma], lr=1e-2)
 
-        self.evaluted_q = torch.empty((self.batch_sz, self.policy_samples), dtype=torch.float32, device=self.device)
-
         self.critic_loss = []
         self.policy_loss = []
         self.mean_q_value = []
@@ -438,70 +449,47 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        next_action, _, _, _ = self.target_policy.get_action(obs=batch_data["next_obs"][:,-1,:])
-        next_action = next_action.squeeze(1)
-        q_target = self.aggregation_operator(state=batch_data['next_obs'][:,-1,:],
-                                             action=next_action,
-                                             critics=self.target_qs,
-                                             mode='min_subset',
-                                             subset_size=2)
-
-        #temporal diff
-        y = q_target
-        for k in range(self.td_horizon-1,-1,-1):
-            termination = batch_data['term'][:,k,:]
-            reward =batch_data['r'][:,k,:]
-            y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
-
-        masks = torch.bernoulli(torch.full((self.batch_sz, self.n_critics), self.p_bootstrap, device=self.device)).bool()
-        losses_this_step = []
-        for k,q in enumerate(self.q_functions):
-            m = masks[:,k]
-            if m.sum() == 0:
-                continue #safeguard: if all mask over data is all 0
-
-            q_value = q.forward(state=batch_data['obs'][m,-1,:], action=batch_data['acts'][m,-1,:])
-            critic_loss = F.mse_loss(q_value, y[m])
-            
-            q.optimizer.zero_grad()
-            critic_loss.backward()
-            if self.critic_gradient_clipping:
-                nn.utils.clip_grad_norm_(q.parameters(), self.critic_gradient_clipping)
-            q.optimizer.step()
-
-            losses_this_step.append(critic_loss.item())
-
-        # ---- Logging ----
-        if losses_this_step:
-            self.critic_loss.append(float(np.mean(losses_this_step)))
+        obs      = batch_data['obs'][:, -1, :]
+        acts     = batch_data['acts'][:, -1, :]
+        next_obs = batch_data['next_obs'][:, -1, :]
 
         with torch.no_grad():
-            q_mean_diag = self.aggregation_operator(
-                state=batch_data['obs'][:,-1,:], action=batch_data['acts'][:,-1,:], critics=self.q_functions, mode='mean'
-            )
-            self.mean_q_value.append(q_mean_diag.mean().item())
+            next_action, _, _, _ = self.target_policy.get_action(obs=next_obs)
+            next_action = next_action.squeeze(1)
 
-    def aggregation_operator(self,
-                             state:torch.Tensor,
-                             action: torch.Tensor,
-                             critics:nn.ModuleList,
-                             mode:str='mean',
-                             beta:float=1.0,
-                             subset_size:int=2) -> torch.Tensor:
-        next_q_values = torch.stack([q.forward(state,action) for q in critics],dim=0) #shape: (n_critis x batch_sz x output_dim)
-        if mode == "mean":
-            return next_q_values.mean(dim=0) #mean across ensemble dim
-        elif mode == "LCB":
-            return next_q_values.mean(dim=0) - beta*(next_q_values.std(dim=0) + 1e-6) #safeguard for collapsing std
-        elif mode == "UCB":
-            return next_q_values.mean(dim=0) + beta*(next_q_values.std(dim=0) + 1e-6)
-        elif mode == "min_subset":
-            idx = torch.randperm(next_q_values.shape[0], device=self.device)[:subset_size]
-            return next_q_values[idx].min(dim=0).values
-        elif mode == "median":
-            return next_q_values.median(dim=0).values
-        else:
-            raise ValueError(f"Unknown aggregation method: {mode}")
+            # Sample target quantile levels and get distributional targets
+            tau_prime = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
+            z_target  = self.target_q(next_obs, next_action, tau_prime)  # (B, N_prime)
+
+            # n-step Bellman backup applied uniformly across quantiles
+            y = z_target
+            for k in range(self.td_horizon - 1, -1, -1):
+                termination = batch_data['term'][:, k, :]  # (B, 1)
+                reward      = batch_data['r'][:, k, :]     # (B, 1)
+                y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y  # (B, N_prime)
+
+        # Sample current quantile levels and predict
+        tau    = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
+        z_pred = self.q_function(obs, acts, tau)  # (B, N)
+
+        # Pairwise TD errors: (B, N_prime, N)
+        td_errors = y.unsqueeze(2) - z_pred.unsqueeze(1)
+        kappa = self.critic_kappa if self.critic_kappa is not None else 1.0
+        critic_loss = quantile_huber_loss(td_errors, tau, kappa)
+
+        self.q_function.optimizer.zero_grad()
+        critic_loss.backward()
+        if self.critic_gradient_clipping:
+            nn.utils.clip_grad_norm_(self.q_function.parameters(), self.critic_gradient_clipping)
+        self.q_function.optimizer.step()
+
+        self.critic_loss.append(critic_loss.item())
+
+        with torch.no_grad():
+            tau_diag = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
+            self.mean_q_value.append(
+                self.q_function(obs, acts, tau_diag).mean(dim=-1).mean().item()
+            )
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
@@ -538,19 +526,21 @@ class MPO_Agent():
 
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
+        obs = batch_data['obs'][:, -1, :]  # (B, obs_dim)
 
         bounded_actions, _, _, raw_actions = self.target_policy.get_action(obs, n_samples=self.policy_samples)
+        # bounded_actions: (B, K, act_dim), raw_actions: (B, K, act_dim)
 
-        # Expand obs and flatten bounded actions for critic (critic trained on post-tanh actions)
-        obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
+        obs_exp   = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
         acts_flat = bounded_actions.reshape(-1, bounded_actions.shape[-1])
+        # Both: (B*K, dim)
 
-        # self.evaluted_q = self.target_critic.forward(state=obs_exp, action=acts_flat).reshape(self.batch_sz, self.policy_samples)
-        self.evaluted_q = self.aggregation_operator(state=obs_exp, action=acts_flat, critics=self.target_qs, mode='mean').reshape(self.batch_sz, self.policy_samples)
+        # Estimate Q as the expected value over quantile samples from the distributional critic
+        tau_eval = torch.rand(obs_exp.shape[0], self.critic_n_quatiles, device=self.device)
+        z_vals   = self.target_q(obs_exp, acts_flat, tau_eval)          # (B*K, N_tau)
+        q_vals   = z_vals.mean(dim=-1).reshape(self.batch_sz, self.policy_samples)  # (B, K)
 
-        eta, weights = self.solve_temp_dual(self.evaluted_q, self.e_step_epsilon, self.n_temp_dual_steps)
-        
+        eta, weights = self.solve_temp_dual(q_vals, self.e_step_epsilon, self.n_temp_dual_steps)
         return raw_actions, weights, eta
 
     def m_step(self,
@@ -603,7 +593,7 @@ class MPO_Agent():
             for p, p_tgt in zip(self.policy.parameters(), self.target_policy.parameters()):
                 p_tgt.data.lerp_(p.data, 1 - self.tau)
 
-        for p, p_tgt in zip(self.q_functions.parameters(), self.target_qs.parameters()):
+        for p, p_tgt in zip(self.q_function.parameters(), self.target_q.parameters()):
             p_tgt.data.lerp_(p.data, 1 - self.tau)
 
     def update(self, critic_only:bool=False) -> None:
@@ -717,23 +707,17 @@ class MPO_Agent():
             "target_policy": self.target_policy.state_dict(),
             "policy_optimizer": self.policy.optimizer.state_dict(),
 
-            "q_functions": [q.state_dict() for q in self.q_functions],
-            "target_qs":   [q.state_dict() for q in self.target_qs],
-            "q_optimizers": [q.optimizer.state_dict() for q in self.q_functions],
+            "q_function": self.q_function.state_dict(),
+            "target_q":   self.target_q.state_dict(),
+            "q_optimizer": self.q_function.optimizer.state_dict(),
 
             "log_eta": self.log_eta.data,
             "alpha_mu": self.alpha_mu.data,
             "alpha_sigma": self.alpha_sigma.data,
 
             "dual_temp_optimizer": self.dual_temp_optimizer.state_dict(),
-            # "dual_kl_mu_optimizer": self.dual_kl_mu_optimizer.state_dict(),
-            # "dual_kl_sigma_optimizer": self.dual_kl_sigma_optimizer.state_dict(),
 
             "global_step": current_env_interaction,
-            "n_critics" : self.n_critics,
-
-            # "torch_rng_state": torch.random.get_rng_state(),
-            # "numpy_rng_state": np.random.get_state(),
         }
         torch.save(checkpoint, os.path.join(folder, f"checkpoint_{current_env_interaction}.pth"))
 

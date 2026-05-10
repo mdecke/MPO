@@ -13,13 +13,16 @@ agent :
     update_delay : 0.1
 
   critic :
-    hidden_layers : [128, 64, 64]
+    psi_layers : [128, 64, 64]
+    f_layers : [32,32]
+    hidden_dim : 128
+    embedding_dim : 64 #nb of cosine basis functions ~ fourier series order
     lr : 0.0001
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
     n_quatiles: 8
-    embedding_dim : 64
+    kappa : 1.0
     risk:
       beta_type : 'neutral' #cvar alternative
       beta_param : None # or float value for CVAR
