@@ -313,7 +313,6 @@ class Critic(nn.Module):
         return self.f_head(h).squeeze(-1)            
         
     
-#TODO: remove ensemble callbacks and implement IQN
 class MPO_Agent():
     def __init__(self,cfg:Dict):
         self.cfg = cfg
@@ -322,9 +321,9 @@ class MPO_Agent():
         self.act_dim = self.cfg.get('environment',{}).get('act_dim')
         self.act_lim = self.cfg.get('environment',{}).get('act_lim', 1.0)
         self.n_envs = self.cfg.get('environment',{}).get('n_envs')
-        self.reward_scale = self.cfg.get('training',{}).get('reward_scale', 1.0)
+        self.reward_scale = self.cfg.get('environment',{}).get('reward_scale', 1.0)
         self.device = self.cfg.get('environment',{}).get('device', 'cpu')
-        self.dt = self.cfg.get('environment',{}).get('dt', 0.1)
+        self.dt = self.cfg.get('environment',{}).get('dt', 0.05)
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
@@ -425,13 +424,6 @@ class MPO_Agent():
         
         
         print("[INFO]: Models initialized")
-
-        self.policy = torch.compile(self.policy)
-        self.target_policy = torch.compile(self.target_policy)
-        self.q_function = torch.compile(self.q_function)
-        self.target_q = torch.compile(self.target_q)
-
-        print("[INFO]: Models compiled")
 
     def _train(self) -> None:
         self.policy.train()
@@ -624,7 +616,6 @@ class MPO_Agent():
         with open(os.path.join(experiment_folder, "hyperparams.json"), "w") as f:
             json.dump(self.cfg, f, indent=2)
 
-        self._train()
         obs, _ = envs.reset(seed=self.cfg.get('environment', {}).get('seed', 42))
 
         episode_returns = torch.zeros(self.n_envs, device=self.device)
@@ -632,9 +623,11 @@ class MPO_Agent():
 
         log_rows = []
         critic_only = True
+        next_checkpoint_at = self.save_checkpoint_rate
 
         progress_bar = tqdm(range(self.training_steps))
         for step in progress_bar:
+            self._eval()
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 action_t, _, _, _ = self.policy.get_action(obs_t)
@@ -674,25 +667,21 @@ class MPO_Agent():
                     "alpha_mu": self.alpha_mu.data,
                     "alpha_sigma": self.alpha_sigma.data,
                 })
-                
+
                 episode_returns[done] = 0.0
                 episode_lengths[done] = 0
+
             if step >= (self.learning_starts + self.policy_learning_starts):
                 critic_only = False
-            
+
             if step >= self.learning_starts:
+                self._train()
                 for _ in range(self.utd_ratio):
                     self.update(critic_only)
 
-            # current_interaction = step * self.n_envs
-            # if current_interaction % self.save_checkpoint_rate == 0:
-            #     self.save_checkpoint(current_interaction, checkpoints_folder)
-
-            next_checkpoint_at = self.save_checkpoint_rate
             current_interaction = (step + 1) * self.n_envs
             if current_interaction >= next_checkpoint_at:
                 self.save_checkpoint(current_interaction, checkpoints_folder)
-                # advance to the next multiple of save_checkpoint_rate beyond current_interaction
                 next_checkpoint_at = ((current_interaction // self.save_checkpoint_rate) + 1) \
                                     * self.save_checkpoint_rate
 
