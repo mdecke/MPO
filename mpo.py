@@ -46,10 +46,11 @@ def get_activation(name:str='relu') -> nn.Module:
     act_f = ACTIVATION_FCTS[name_lower]
     return act_f()
 
-def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1) -> None:
+def init_model_weights(model:nn.Module, mean:float=0.0, std:float=0.1, nonlinearity:str='relu') -> None:
     for module in model.modules():
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+            # nn.init.normal_(module.weight, mean=0.0, std=std)
+            nn.init.kaiming_normal_(module.weight, nonlinearity=nonlinearity)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
@@ -64,7 +65,7 @@ def quantile_huber_loss(td_errors: torch.Tensor, tau: torch.Tensor, kappa: float
                         kappa * (abs_err - 0.5 * kappa))
     # asymmetric quantile weight: |tau - 1(delta < 0)|
     tau_w = (tau.unsqueeze(1) - (td_errors.detach() < 0).float()).abs()  # (B, N_prime, N)
-    return (tau_w * huber).sum(dim=2).mean(dim=1).mean()
+    return (tau_w * huber/kappa).sum(dim=2).mean(dim=1).mean()
 
 def load_config(config_dict_path:str, args) -> Dict:
     with open(config_dict_path, 'r') as file:
@@ -304,7 +305,6 @@ class Critic(nn.Module):
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         
     def forward(self, state:torch.Tensor, action:torch.Tensor, tau:torch.Tensor) -> torch.Tensor:
-        B, N = tau.shape
         sa = torch.cat((state,action), dim=-1)
         psi_sa = self.psi(sa)                                              # (B, H)
         cos = torch.cos(math.pi * tau.unsqueeze(-1) * self.cos_idx)                 # (B, N, E)
@@ -323,7 +323,7 @@ class MPO_Agent():
         self.n_envs = self.cfg.get('environment',{}).get('n_envs')
         self.reward_scale = self.cfg.get('environment',{}).get('reward_scale', 1.0)
         self.device = self.cfg.get('environment',{}).get('device', 'cpu')
-        self.dt = self.cfg.get('environment',{}).get('dt', 0.05)
+        self.dt = self.cfg.get('environment',{}).get('dt', 0.1)
 
         self.gamma = self.cfg.get('agent', {}).get('params',{}).get('gamma', 0.99)
         self.tau = self.cfg.get('agent', {}).get('params',{}).get('tau', 0.95)
@@ -348,8 +348,8 @@ class MPO_Agent():
         self.critic_gradient_clipping = self.cfg.get('agent',{}).get('critic',{}).get('gradient_clip', None)
         self.critic_embedding_dim = self.cfg.get('agent',{}).get('critic',{}).get('embedding_dim', None)
         self.critic_hidden_dim = self.cfg.get('agent',{}).get('critic',{}).get('hidden_dim', None)
-        self.critic_kappa = self.cfg.get('agent',{}).get('critic',{}).get('kappa', None)
-        self.critic_n_quatiles = self.cfg.get('agent',{}).get('critic',{}).get('n_quatiles', 1)
+        self.critic_kappa = self.cfg.get('agent',{}).get('critic',{}).get('kappa', 1.0)
+        self.critic_n_quantiles = self.cfg.get('agent',{}).get('critic',{}).get('n_quantiles', 1)
         self.critic_risk_type = self.cfg.get('agent',{}).get('critic',{}).get('risk', {}).get('beta_type','neutral')
         self.critic_risk_param = self.cfg.get('agent',{}).get('critic',{}).get('risk', {}).get('beta_param',None)
 
@@ -400,14 +400,14 @@ class MPO_Agent():
                             lr=self.policy_lr,
                             activation_fct=self.policy_actv_fct,
                             layer_norm=self.policy_layer_norm).to(self.device)
-        init_model_weights(self.policy)
+        init_model_weights(self.policy,self.policy_actv_fct)
 
         self.target_policy = copy.deepcopy(self.policy)
         #Targets only updated via polyak interpolation, no need to track grads
         for p in self.target_policy.parameters():
             p.requires_grad = False
         
-        #--- Critic ensemble ---
+        #--- Critic IQN ---
         self.q_function = Critic(self.obs_dim + self.act_dim,
                                  self.critic_psi_layers,
                                  self.critic_f_layers,
@@ -416,7 +416,7 @@ class MPO_Agent():
                                  self.critic_lr,
                                  self.critic_actv_fct,
                                  self.critic_layer_norm).to(self.device)
-        init_model_weights(self.q_function)
+        init_model_weights(self.q_function, self.critic_actv_fct)
         
         self.target_q = copy.deepcopy(self.q_function)
         for p in self.target_q.parameters():
@@ -441,8 +441,8 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        obs      = batch_data['obs'][:, -1, :]
-        acts     = batch_data['acts'][:, -1, :]
+        obs = batch_data['obs'][:, -1, :]
+        acts = batch_data['acts'][:, -1, :]
         next_obs = batch_data['next_obs'][:, -1, :]
 
         with torch.no_grad():
@@ -450,24 +450,23 @@ class MPO_Agent():
             next_action = next_action.squeeze(1)
 
             # Sample target quantile levels and get distributional targets
-            tau_prime = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
-            z_target  = self.target_q(next_obs, next_action, tau_prime)  # (B, N_prime)
+            tau_prime = torch.rand(self.batch_sz, self.critic_n_quantiles, device=self.device)
+            z_target = self.target_q(next_obs, next_action, tau_prime)  # (B, N_prime)
 
-            # n-step Bellman backup applied uniformly across quantiles
+            
             y = z_target
             for k in range(self.td_horizon - 1, -1, -1):
                 termination = batch_data['term'][:, k, :]  # (B, 1)
-                reward      = batch_data['r'][:, k, :]     # (B, 1)
+                reward = batch_data['r'][:, k, :]     # (B, 1)
                 y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y  # (B, N_prime)
 
         # Sample current quantile levels and predict
-        tau    = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
+        tau = torch.rand(self.batch_sz, self.critic_n_quantiles, device=self.device)
         z_pred = self.q_function(obs, acts, tau)  # (B, N)
 
         # Pairwise TD errors: (B, N_prime, N)
         td_errors = y.unsqueeze(2) - z_pred.unsqueeze(1)
-        kappa = self.critic_kappa if self.critic_kappa is not None else 1.0
-        critic_loss = quantile_huber_loss(td_errors, tau, kappa)
+        critic_loss = quantile_huber_loss(td_errors, tau, self.critic_kappa)
 
         self.q_function.optimizer.zero_grad()
         critic_loss.backward()
@@ -478,7 +477,7 @@ class MPO_Agent():
         self.critic_loss.append(critic_loss.item())
 
         with torch.no_grad():
-            tau_diag = torch.rand(self.batch_sz, self.critic_n_quatiles, device=self.device)
+            tau_diag = torch.rand(self.batch_sz, self.critic_n_quantiles, device=self.device)
             self.mean_q_value.append(
                 self.q_function(obs, acts, tau_diag).mean(dim=-1).mean().item()
             )
@@ -515,22 +514,36 @@ class MPO_Agent():
                 dual_optimizer.step()
 
         return log_alpha.exp().detach()
+    
+    def _apply_risk_distortion(self, tau:torch.Tensor) -> torch.Tensor:
+        if self.critic_risk_type == 'neutral':
+            return tau
+        elif self.critic_risk_type == 'cvar':
+            # CVaR(eta): sample tau ~ U([0, eta]) -> shift mass to lower tail
+            return self.critic_risk_param * tau
+        elif self.critic_risk_type == 'wang':
+            # Wang(eta): Phi(Phi^-1(tau) + eta)
+            normal = dist.Normal(0.0, 1.0)
+            return normal.cdf(normal.icdf(tau.clamp(1e-6, 1 - 1e-6)) + self.critic_risk_param)
+        else:
+            raise ValueError(f"Unknown risk distortion: {self.critic_risk_type}") 
 
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = batch_data['obs'][:, -1, :]  # (B, obs_dim)
 
         bounded_actions, _, _, raw_actions = self.target_policy.get_action(obs, n_samples=self.policy_samples)
-        # bounded_actions: (B, K, act_dim), raw_actions: (B, K, act_dim)
 
-        obs_exp   = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
+        obs_exp = obs.unsqueeze(1).expand(-1, self.policy_samples, -1).reshape(-1, obs.shape[-1])
         acts_flat = bounded_actions.reshape(-1, bounded_actions.shape[-1])
-        # Both: (B*K, dim)
 
-        # Estimate Q as the expected value over quantile samples from the distributional critic
-        tau_eval = torch.rand(obs_exp.shape[0], self.critic_n_quatiles, device=self.device)
-        z_vals   = self.target_q(obs_exp, acts_flat, tau_eval)          # (B*K, N_tau)
-        q_vals   = z_vals.mean(dim=-1).reshape(self.batch_sz, self.policy_samples)  # (B, K)
+        #Q ~ expected value over quantile samples from the distributional critic
+        # tau_eval = torch.rand(obs_exp.shape[0], self.critic_n_quatiles, device=self.device)
+        tau_eval = self._apply_risk_distortion(torch.rand(obs_exp.shape[0],
+                                                          self.critic_n_quantiles,
+                                                          device=self.device))
+        z_vals = self.target_q(obs_exp, acts_flat, tau_eval) # (B*K, N_tau)
+        q_vals = z_vals.mean(dim=-1).reshape(self.batch_sz, self.policy_samples)
 
         eta, weights = self.solve_temp_dual(q_vals, self.e_step_epsilon, self.n_temp_dual_steps)
         return raw_actions, weights, eta
