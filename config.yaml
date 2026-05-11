@@ -1,7 +1,8 @@
 environment: 
   seed : 42
   device : cpu
-  reward_scale : 10
+  reward_scale : 1
+  dt : 0.05
 
 agent :
   policy :
@@ -10,28 +11,31 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    update_delay : 0.1
 
   critic :
-    psi_layers : [128, 64, 64]
-    f_layers : [32,32]
+    psi_layers : [128,128]
+    f_layers : [128]
     hidden_dim : 128
     embedding_dim : 64 #nb of cosine basis functions ~ fourier series order
     lr : 0.0001
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    n_quatiles: 8
+    n_quantiles: 64
     kappa : 1.0
     risk:
-      beta_type : 'neutral' #cvar alternative
-      beta_param : None # or float value for CVAR
+      beta_type : 'wang' #cvar or wang alternative
+      beta_param : -0.75 # or float value for CVAR and wang
+      schedule:
+        enabled : true
+        warmup_steps : 0.3 # fraction of training steps where risk held at neutral 
+        anneal_steps : 0.4 # fraction of trainig steps where risk param evolves linear ramp to target; held at target after
   
   params:
     gamma : 0.99
     tau : 0.95
     policy_samples : 20
-    e_step_epsilon : 1 #TODO: what default value
+    e_step_epsilon : 0.1 #TODO: what default value
     n_temp_dual_steps : 5
     m_step_epsilon_mu : 0.1
     m_step_epsilon_sigma : 0.0001
@@ -40,12 +44,12 @@ agent :
 buffer :
   batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
-  td_horizon : 3
+  td_horizon : 5
 
 training :
   max_interactions : 200000
   warm_up : 1000  # Fill buffer before training
   learning_starts : 3000
   save_checkpoint_rate : 500
-  utd_ratio : 3
+  utd_ratio : 1
   policy_learning_starts : 2000 #after learning starts
