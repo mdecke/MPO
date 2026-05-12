@@ -119,6 +119,7 @@ class Buffer:
         self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.next_obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
+        self.old_policy_log_probs = torch.empty((self.N, self.envs,1), dtype=torch.float32, device=self.device)
         self.rewards = torch.empty((self.N, self.envs, 1), dtype=torch.float32, device=self.device)
         self.truncation = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
         self.termination = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
@@ -130,6 +131,7 @@ class Buffer:
     def add_sample(self,
                    obs:torch.Tensor,
                    actions:torch.Tensor,
+                   log_probs_mu:torch.Tensor,
                    next_obs:torch.Tensor,
                    rewards:torch.Tensor,
                    truncation:torch.Tensor,
@@ -139,6 +141,7 @@ class Buffer:
         index = self.env_steps % self.N 
         self.obs[index].copy_(obs)
         self.actions[index].copy_(actions)
+        self.old_policy_log_probs[index].copy_(log_probs_mu)
         self.rewards[index].copy_(rewards.view(self.envs, 1))
         self.next_obs[index].copy_(next_obs)
         self.truncation[index].copy_(truncation.view(self.envs, 1))
@@ -167,6 +170,7 @@ class Buffer:
 
         obs_hist = self.obs[time_window,env_window,:]
         act_hist = self.actions[time_window,env_window,:]
+        old_policy_log_probs_hist = self.old_policy_log_probs[time_window, env_window,:]
         next_obs_hist = self.next_obs[time_window,env_window,:]
         r_hist = self.rewards[time_window,env_window,:]
         trunc_hist = self.truncation[time_window,env_window,:]
@@ -174,6 +178,7 @@ class Buffer:
 
         batch = {"obs": obs_hist,
                  "acts": act_hist,
+                 "log_probs": old_policy_log_probs_hist,
                  "next_obs": next_obs_hist,
                  "r": r_hist,
                  "term": term_hist,
