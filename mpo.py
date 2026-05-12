@@ -648,7 +648,7 @@ class MPO_Agent():
             self._eval()
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                action_t, _, _, _ = self.policy.get_action(obs_t)
+                action_t, old_log_probs_t, _, _ = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
@@ -660,7 +660,13 @@ class MPO_Agent():
 
             episode_returns += reward_t
 
-            self.buffer.add_sample(obs_t, action_t, next_obs_t, reward_t * self.reward_scale, truncated_t, terminated_t)
+            self.buffer.add_sample(obs=obs_t,
+                                   actions=action_t,
+                                   log_probs_mu=old_log_probs_t,
+                                   next_obs=next_obs_t,
+                                   rewards=reward_t * self.reward_scale,
+                                   truncation=truncated_t, 
+                                   termination=terminated_t)
             obs = next_obs
             episode_lengths += 1
 
