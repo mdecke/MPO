@@ -1,7 +1,7 @@
 environment: 
   seed : 42
   device : cpu
-  reward_scale : 10
+  reward_scale : 0.01
   dt : 0.05
 
 agent :
@@ -44,7 +44,7 @@ agent :
 buffer :
   batch_size : 256  # Much larger for stable gradients
   buffer_size : 1000000
-  td_horizon : 5
+  td_horizon : 3
 
 training :
   max_interactions : 200000
