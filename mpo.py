@@ -662,7 +662,9 @@ class MPO_Agent():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 action_t, old_log_probs_t, _, raw_actions_t = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
-
+                old_log_probs_t = old_log_probs_t.squeeze(1)
+                raw_actions_t = raw_actions_t.squeeze(1)
+                
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
 
             reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
