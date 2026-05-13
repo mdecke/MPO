@@ -435,33 +435,28 @@ class MPO_Agent():
                 a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
                 a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
                 q_kp1 = self.aggregation_operator(state=s_kp1,
-                                                action=a_kp1,
-                                                critics=self.target_qs,
-                                                mode='min_subset',
-                                                subset_size=2,
-                                                subset_idx=subset_idx)
+                                                  action=a_kp1,
+                                                  critics=self.target_qs,
+                                                  mode='min_subset',
+                                                  subset_size=2,
+                                                  subset_idx=subset_idx)
                 if k == 0:
                     q_k = y
                 else:
                     q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
-                                                            action=batch_data['acts'][:,k,:],
-                                                            critics=self.target_qs, mode='min_subset',
-                                                            subset_size=2,
-                                                            subset_idx=subset_idx)
+                                                    action=batch_data['acts'][:,k,:],
+                                                    critics=self.target_qs, mode='min_subset',
+                                                    subset_size=2,
+                                                    subset_idx=subset_idx)
                 
                 delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
 
                 if k > 0:
                     logp_behavior_k = batch_data['log_probs'][:, k, :]
                     logp_target_k  = self.target_policy.get_log_probs(batch_data['obs'][:, k, :],
-                                                                  batch_data['raw_acts'][:, k, :])
+                                                                      batch_data['raw_acts'][:, k, :])
                     c_k = self.importance_sampling_coef(logp_target_k, logp_behavior_k, mode='retrace')
                     c_prod *= c_k
-                    # for i in range(1, k + 1):  # Retrace: product over i = {1 -> k}
-                    #     logp_behavior_i = batch_data['log_probs'][:,i,:]
-                    #     logp_target_i = self.target_policy.get_log_probs(batch_data['obs'][:,i,:],
-                    #                                                     batch_data['raw_acts'][:,i,:])
-                    #     c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i, mode='retrace')
                 
                 y += (self.gamma ** k) * c_prod * delta_k
                     
