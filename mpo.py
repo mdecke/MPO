@@ -420,36 +420,41 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        y = self.aggregation_operator(state=batch_data['obs'][:,0,:],
-                                      action=batch_data['acts'][:,0,:],
-                                      critics=self.target_qs, mode='min_subset',
-                                      subset_size=2)
-        for k in range(self.td_horizon):
-            r_k = batch_data['r'][:,k,:]
-            term_k = batch_data['term'][:,k,:]
-            s_kp1 = batch_data['next_obs'][:,k,:]
-            a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
-            a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
-            q_kp1 = self.aggregation_operator(state=s_kp1,
-                                              action=a_kp1,
-                                              critics=self.target_qs,
-                                              mode='min_subset',
-                                              subset_size=2)
-            q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
-                                                     action=batch_data['acts'][:,k,:],
-                                                     critics=self.target_qs, mode='min_subset',
-                                                     subset_size=2)
-            delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
+        #TODO: make subset flagging better
+        subset_idx = torch.randperm(self.n_critics, device=self.device)[:2]
+        with torch.no_grad():
+            y = self.aggregation_operator(state=batch_data['obs'][:,0,:],
+                                        action=batch_data['acts'][:,0,:],
+                                        critics=self.target_qs, mode='min_subset',
+                                        subset_size=2, subset_idx=subset_idx)
+            for k in range(self.td_horizon):
+                r_k = batch_data['r'][:,k,:]
+                term_k = batch_data['term'][:,k,:]
+                s_kp1 = batch_data['next_obs'][:,k,:]
+                a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
+                a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
+                q_kp1 = self.aggregation_operator(state=s_kp1,
+                                                action=a_kp1,
+                                                critics=self.target_qs,
+                                                mode='min_subset',
+                                                subset_size=2,
+                                                subset_idx=subset_idx)
+                q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
+                                                        action=batch_data['acts'][:,k,:],
+                                                        critics=self.target_qs, mode='min_subset',
+                                                        subset_size=2,
+                                                        subset_idx=subset_idx)
+                delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
 
-            c = 1
-            if k > 0:
-                for i in range(1, k + 1):  # Retrace: product over c_{1..k}, not c_{0..k-1}
-                    logp_behavior_i = batch_data['log_probs'][:,i,:]
-                    logp_target_i = self.target_policy.get_log_probs(batch_data['obs'][:,i,:],
-                                                                     batch_data['raw_acts'][:,i,:])
-                    c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i, mode='retrace')
-            
-            y += (self.gamma ** k) * c * delta_k
+                c = 1
+                if k > 0:
+                    for i in range(1, k + 1):  # Retrace: product over c_{1..k}, not c_{0..k-1}
+                        logp_behavior_i = batch_data['log_probs'][:,i,:]
+                        logp_target_i = self.target_policy.get_log_probs(batch_data['obs'][:,i,:],
+                                                                        batch_data['raw_acts'][:,i,:])
+                        c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i, mode='retrace')
+                
+                y += (self.gamma ** k) * c * delta_k
                     
         # Basic nstep bootstrapping
         # for k in range(self.td_horizon-1,-1,-1):
@@ -491,7 +496,8 @@ class MPO_Agent():
                              critics:nn.ModuleList,
                              mode:str='mean',
                              beta:float=1.0,
-                             subset_size:int=2) -> torch.Tensor:
+                             subset_size:int=2,
+                             subset_idx=None) -> torch.Tensor:
         next_q_values = torch.stack([q.forward(state,action) for q in critics],dim=0) #shape: (n_critis x batch_sz x output_dim)
         if mode == "mean":
             return next_q_values.mean(dim=0) #mean across ensemble dim
@@ -500,8 +506,9 @@ class MPO_Agent():
         elif mode == "UCB":
             return next_q_values.mean(dim=0) + beta*(next_q_values.std(dim=0) + 1e-6)
         elif mode == "min_subset":
-            idx = torch.randperm(next_q_values.shape[0], device=self.device)[:subset_size]
-            return next_q_values[idx].min(dim=0).values
+            if subset_idx == None:
+                subset_idx = torch.randperm(next_q_values.shape[0], device=self.device)[:subset_size]
+            return next_q_values[subset_idx].min(dim=0).values
         elif mode == "median":
             return next_q_values.median(dim=0).values
         else:
