@@ -421,57 +421,88 @@ class MPO_Agent():
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
         #TODO: make subset flagging better
-        subset_idx = torch.randperm(self.n_critics, device=self.device)[:2]
+        B = self.batch_sz
+        n = self.td_horizon
+
         with torch.no_grad():
-            y = self.aggregation_operator(state=batch_data['obs'][:,0,:],
-                                        action=batch_data['acts'][:,0,:],
-                                        critics=self.target_qs, mode='min_subset',
-                                        subset_size=2, subset_idx=subset_idx)
-            c_prod = torch.ones((self.batch_sz, 1), device=self.device)
-            for k in range(self.td_horizon):
-                r_k = batch_data['r'][:,k,:]
-                term_k = batch_data['term'][:,k,:]
-                s_kp1 = batch_data['next_obs'][:,k,:]
-                a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
-                a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
-                q_kp1 = self.aggregation_operator(state=s_kp1,
-                                                  action=a_kp1,
-                                                  critics=self.target_qs,
-                                                  mode='min_subset',
-                                                  subset_size=2,
-                                                  subset_idx=subset_idx)
-                if k == 0:
-                    q_k = y
-                else:
-                    q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
-                                                    action=batch_data['acts'][:,k,:],
-                                                    critics=self.target_qs, mode='min_subset',
-                                                    subset_size=2,
-                                                    subset_idx=subset_idx)
-                
-                delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
+            subset_idx = torch.randperm(self.n_critics, device=self.device)[:2]
+
+            s_next_flat = batch_data['next_obs'].reshape(B * n, -1)              # (B*n, obs_dim)
+            a_next_flat, _, _, _ = self.target_policy.get_action(s_next_flat)
+            a_next_flat = a_next_flat.squeeze(1)                                 # (B*n, act_dim)
+
+            # Batched target-Q at ALL (s_{k+1}, a*) for k=0..n-1
+            # Shape stacked across critics: (n_critics, B*n, 1)
+            q_next_stack = torch.stack(
+                [q.forward(s_next_flat, a_next_flat) for q in self.target_qs], dim=0
+            )
+            V_pi = q_next_stack[subset_idx].min(dim=0).values.reshape(B, n)      # (B, n)
+
+            #Batched target-Q at ALL (s_k, a_k) along the stored trajectory
+            s_flat = batch_data['obs'].reshape(B * n, -1)                        # (B*n, obs_dim)
+            a_flat = batch_data['acts'].reshape(B * n, -1)                       # (B*n, act_dim)
+            q_traj_stack = torch.stack(
+                [q.forward(s_flat, a_flat) for q in self.target_qs], dim=0
+            )
+            Q_traj = q_traj_stack[subset_idx].min(dim=0).values.reshape(B, n)    # (B, n)
+
+            # All target log-probs along the trajectory in one pass
+            if n > 1:
+                s_mid_flat   = batch_data['obs'][:, 1:, :].reshape(B * (n - 1), -1)
+                raw_mid_flat = batch_data['raw_acts'][:, 1:, :].reshape(B * (n - 1), -1)
+                logp_pi_mid  = self.target_policy.get_log_probs(s_mid_flat, raw_mid_flat)
+                logp_pi      = logp_pi_mid.reshape(B, n - 1)                     # (B, n-1)
+                logp_mu      = batch_data['log_probs'][:, 1:, :].squeeze(-1)     # (B, n-1)
+                c_all = (logp_pi - logp_mu).exp().clamp(max=1.0)                 # (B, n-1)
+
+            y = Q_traj[:, 0:1].clone()                                            # = Q(s_0, a_0)
+            c_prod = torch.ones((B, 1), device=self.device)
+            for k in range(n):
+                v_kp1   = V_pi[:, k:k+1]                                          # V_pi(s_{k+1})
+                q_k     = Q_traj[:, k:k+1]                                        # Q(s_k, a_k)
+                r_k     = batch_data['r'][:, k, :]
+                term_k  = batch_data['term'][:, k, :]
+                delta_k = r_k + self.gamma * (~term_k) * v_kp1 - q_k
 
                 if k > 0:
-                    logp_behavior_k = batch_data['log_probs'][:, k, :]
-                    logp_target_k  = self.target_policy.get_log_probs(batch_data['obs'][:, k, :],
-                                                                      batch_data['raw_acts'][:, k, :])
-                    c_k = self.importance_sampling_coef(logp_target_k, logp_behavior_k, mode='retrace')
-                    c_prod *= c_k
-                
-                y += (self.gamma ** k) * c_prod * delta_k
-                    
-        # Basic nstep bootstrapping
-        # for k in range(self.td_horizon-1,-1,-1):
-        #     termination = batch_data['term'][:,k,:]
-        #     reward =batch_data['r'][:,k,:]
-        #     y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
+                    c_prod = c_prod * c_all[:, k-1:k]                             # multiply in c_k
+
+                y = y + (self.gamma ** k) * c_prod * delta_k
+
+        obs  = batch_data['obs'][:, 0, :]
+        acts = batch_data['acts'][:, 0, :]
+        masks = torch.bernoulli(
+            torch.full((B, self.n_critics), self.p_bootstrap, device=self.device)
+        ).bool()
+        losses_this_step = []
+        for k_critic, q in enumerate(self.q_functions):
+            m = masks[:, k_critic]
+            if m.sum() == 0:
+                continue
+            q_value = q.forward(state=obs[m], action=acts[m])
+            critic_loss = F.mse_loss(q_value, y[m])
+            q.optimizer.zero_grad()
+            critic_loss.backward()
+            if self.critic_gradient_clipping:
+                nn.utils.clip_grad_norm_(q.parameters(), self.critic_gradient_clipping)
+            q.optimizer.step()
+            losses_this_step.append(critic_loss.item())
+
+        if losses_this_step:
+            self.critic_loss.append(float(np.mean(losses_this_step)))
+
+        with torch.no_grad():
+            q_mean_diag = self.aggregation_operator(
+                state=obs, action=acts, critics=self.q_functions, mode='mean'
+            )
+            self.mean_q_value.append(q_mean_diag.mean().item())
 
         masks = torch.bernoulli(torch.full((self.batch_sz, self.n_critics), self.p_bootstrap, device=self.device)).bool()
         losses_this_step = []
         for k,q in enumerate(self.q_functions):
             m = masks[:,k]
             if m.sum() == 0:
-                continue #safeguard: if all mask over data is all 0
+                continue 
 
             q_value = q.forward(state=batch_data['obs'][m,0,:], action=batch_data['acts'][m,0,:])
             critic_loss = F.mse_loss(q_value, y[m])
