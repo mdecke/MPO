@@ -262,6 +262,13 @@ class Actor(nn.Module):
         log_probs = log_probs.sum(2, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return actions, log_probs, mean, raw_acts
+    
+    def get_log_probs(self, obs:torch.Tensor, raw_action:torch.Tensor) -> torch.Tensor:
+        distribution = self.forward(obs)
+        scaled_acts = torch.tanh(raw_action)
+        log_probs = distribution.log_prob(raw_action)
+        log_probs -= torch.log(self.action_scale * (1 - scaled_acts.pow(2)) + 1e-6)
+        return log_probs.sum(-1, keepdim=True)
 
 
 class Critic(nn.Module):
