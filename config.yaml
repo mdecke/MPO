@@ -1,7 +1,7 @@
 environment: 
   seed : 42
   device : cpu
-  reward_scale : 1
+  reward_scale : 10
   dt : 0.05
 
 agent :
