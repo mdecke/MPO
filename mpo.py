@@ -119,6 +119,7 @@ class Buffer:
         self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.next_obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
+        self.raw_actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
         self.old_policy_log_probs = torch.empty((self.N, self.envs,1), dtype=torch.float32, device=self.device)
         self.rewards = torch.empty((self.N, self.envs, 1), dtype=torch.float32, device=self.device)
         self.truncation = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
@@ -131,6 +132,7 @@ class Buffer:
     def add_sample(self,
                    obs:torch.Tensor,
                    actions:torch.Tensor,
+                   raw_actions:torch.Tensor,
                    log_probs_mu:torch.Tensor,
                    next_obs:torch.Tensor,
                    rewards:torch.Tensor,
@@ -141,6 +143,7 @@ class Buffer:
         index = self.env_steps % self.N 
         self.obs[index].copy_(obs)
         self.actions[index].copy_(actions)
+        self.raw_actions[index].copy_(raw_actions)
         self.old_policy_log_probs[index].copy_(log_probs_mu)
         self.rewards[index].copy_(rewards.view(self.envs, 1))
         self.next_obs[index].copy_(next_obs)
@@ -170,6 +173,7 @@ class Buffer:
 
         obs_hist = self.obs[time_window,env_window,:]
         act_hist = self.actions[time_window,env_window,:]
+        raw_act_hist = self.raw_actions[time_window,env_window,:]
         old_policy_log_probs_hist = self.old_policy_log_probs[time_window, env_window,:]
         next_obs_hist = self.next_obs[time_window,env_window,:]
         r_hist = self.rewards[time_window,env_window,:]
@@ -178,6 +182,7 @@ class Buffer:
 
         batch = {"obs": obs_hist,
                  "acts": act_hist,
+                 "raw_acts": raw_act_hist,
                  "log_probs": old_policy_log_probs_hist,
                  "next_obs": next_obs_hist,
                  "r": r_hist,
@@ -648,7 +653,7 @@ class MPO_Agent():
             self._eval()
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                action_t, old_log_probs_t, _, _ = self.policy.get_action(obs_t)
+                action_t, old_log_probs_t, _, raw_actions_t = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
@@ -662,6 +667,7 @@ class MPO_Agent():
 
             self.buffer.add_sample(obs=obs_t,
                                    actions=action_t,
+                                   raw_actions=raw_actions_t,
                                    log_probs_mu=old_log_probs_t,
                                    next_obs=next_obs_t,
                                    rewards=reward_t * self.reward_scale,
