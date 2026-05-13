@@ -443,6 +443,11 @@ class MPO_Agent():
             if k > 0:
                 for i in range(k):
                     logp_behavior_i = batch_data['log_probs'][:,i,:]
+                    logp_target_i = self.target_policy.get_log_probs(batch_data['obs'][:,i,:],
+                                                                     batch_data['raw_acts'][:,i,:])
+                    c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i)
+            
+            y += (self.gamma ** k) * c * delta_k
                     
         # Basic nstep bootstrapping
         # for k in range(self.td_horizon-1,-1,-1):
@@ -658,7 +663,7 @@ class MPO_Agent():
         for step in progress_bar:
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                action_t, old_log_probs_t, _, _ = self.policy.get_action(obs_t)
+                action_t, old_log_probs_t, _, raw_action_t = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
@@ -672,6 +677,7 @@ class MPO_Agent():
 
             self.buffer.add_sample(obs=obs_t,
                                    actions=action_t,
+                                   raw_actions=raw_action_t,
                                    log_probs_mu=old_log_probs_t,
                                    next_obs=next_obs_t,
                                    rewards=reward_t * self.reward_scale,
