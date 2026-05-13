@@ -428,11 +428,13 @@ class MPO_Agent():
             r_k = batch_data['r'][:,k,:]
             term_k = batch_data['term'][:,k,:]
             s_kp1 = batch_data['next_obs'][:,k,:]
-            a_kp1 = self.target_policy.get_action(s_kp1)
+            a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
+            a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
             q_kp1 = self.aggregation_operator(state=s_kp1,
-                                                     action=a_kp1,
-                                                     critics=self.target_qs, mode='min_subset',
-                                                     subset_size=2)
+                                              action=a_kp1,
+                                              critics=self.target_qs,
+                                              mode='min_subset',
+                                              subset_size=2)
             q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
                                                      action=batch_data['acts'][:,k,:],
                                                      critics=self.target_qs, mode='min_subset',
@@ -441,11 +443,11 @@ class MPO_Agent():
 
             c = 1
             if k > 0:
-                for i in range(k):
+                for i in range(1, k + 1):  # Retrace: product over c_{1..k}, not c_{0..k-1}
                     logp_behavior_i = batch_data['log_probs'][:,i,:]
                     logp_target_i = self.target_policy.get_log_probs(batch_data['obs'][:,i,:],
                                                                      batch_data['raw_acts'][:,i,:])
-                    c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i)
+                    c *= self.importance_sampling_coef(logp_target_i, logp_behavior_i, mode='retrace')
             
             y += (self.gamma ** k) * c * delta_k
                     
@@ -462,7 +464,7 @@ class MPO_Agent():
             if m.sum() == 0:
                 continue #safeguard: if all mask over data is all 0
 
-            q_value = q.forward(state=batch_data['obs'][m,-1,:], action=batch_data['acts'][m,-1,:])
+            q_value = q.forward(state=batch_data['obs'][m,0,:], action=batch_data['acts'][m,0,:])
             critic_loss = F.mse_loss(q_value, y[m])
             
             q.optimizer.zero_grad()
@@ -508,7 +510,7 @@ class MPO_Agent():
     def importance_sampling_coef(self,
                                  log_pi:torch.Tensor,
                                  log_mu: torch.Tensor,
-                                 mode:str='IS',
+                                 mode:str='retrace',
                                  _lambda:float=1.0) -> torch.Tensor:
         if mode == "IS":
             return (log_pi-log_mu).exp()
@@ -554,7 +556,7 @@ class MPO_Agent():
 
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = batch_data['obs'][:, -1, :]  # (batch_sz, obs_dim)
+        obs = batch_data['obs'][:, 0, :]  # (batch_sz, obs_dim) — same step critic MSE trains on
 
         bounded_actions, _, _, raw_actions = self.target_policy.get_action(obs, n_samples=self.policy_samples)
 
@@ -598,8 +600,8 @@ class MPO_Agent():
         # alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
 
         # No loop needed
-        self.alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.1)
-        self.alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.1)
+        self.alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.0)
+        self.alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.0)
 
         policy_loss = (nll
                        + self.alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
@@ -629,7 +631,7 @@ class MPO_Agent():
         # print(f"critic update duration: {time.perf_counter() - t_0_critic}")
         
         if not critic_only:
-            obs = batch['obs'][:, -1, :]
+            obs = batch['obs'][:, 0, :]
             with torch.no_grad():
                 # t_0_e_step = time.perf_counter()
                 sampled_actions, weights, _ = self.e_step(batch)
@@ -665,6 +667,8 @@ class MPO_Agent():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 action_t, old_log_probs_t, _, raw_action_t = self.policy.get_action(obs_t)
                 action_t = action_t.squeeze(1)
+                raw_action_t = raw_action_t.squeeze(1)
+                old_log_probs_t = old_log_probs_t.squeeze(1)
 
             next_obs, reward, terminated, truncated, _ = envs.step(action_t.cpu().numpy())
 
