@@ -106,6 +106,7 @@ class Buffer:
         self.obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.next_obs = torch.empty((self.N, self.envs, *obs_shape), dtype=torch.float32, device=self.device)
         self.actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
+        self.raw_actions = torch.empty((self.N, self.envs, *act_shape), dtype=action_dtype, device=self.device)
         self.old_policy_log_probs = torch.empty((self.N, self.envs,1), dtype=torch.float32, device=self.device)
         self.rewards = torch.empty((self.N, self.envs, 1), dtype=torch.float32, device=self.device)
         self.truncation = torch.empty((self.N, self.envs, 1), dtype=torch.bool, device=self.device)
@@ -118,6 +119,7 @@ class Buffer:
     def add_sample(self,
                    obs:torch.Tensor,
                    actions:torch.Tensor,
+                   raw_actions:torch.Tensor,
                    log_probs_mu:torch.Tensor,
                    next_obs:torch.Tensor,
                    rewards:torch.Tensor,
@@ -128,6 +130,7 @@ class Buffer:
         index = self.env_steps % self.N 
         self.obs[index].copy_(obs)
         self.actions[index].copy_(actions)
+        self.raw_actions[index].copy_(raw_actions)
         self.old_policy_log_probs[index].copy_(log_probs_mu)
         self.rewards[index].copy_(rewards.view(self.envs, 1))
         self.next_obs[index].copy_(next_obs)
@@ -157,6 +160,7 @@ class Buffer:
 
         obs_hist = self.obs[time_window,env_window,:]
         act_hist = self.actions[time_window,env_window,:]
+        raw_act_hist = self.raw_actions[time_window,env_window,:]
         old_policy_log_probs_hist = self.old_policy_log_probs[time_window, env_window,:]
         next_obs_hist = self.next_obs[time_window,env_window,:]
         r_hist = self.rewards[time_window,env_window,:]
@@ -165,6 +169,7 @@ class Buffer:
 
         batch = {"obs": obs_hist,
                  "acts": act_hist,
+                 "raw_acts": raw_act_hist,
                  "log_probs": old_policy_log_probs_hist,
                  "next_obs": next_obs_hist,
                  "r": r_hist,
@@ -244,6 +249,13 @@ class Actor(nn.Module):
         log_probs = log_probs.sum(2, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return actions, log_probs, mean, raw_acts
+    
+    def get_log_probs(self, obs:torch.Tensor, raw_action:torch.Tensor) -> torch.Tensor:
+        distribution = self.forward(obs)
+        scaled_acts = torch.tanh(raw_action)
+        log_probs = distribution.log_prob(raw_action)
+        log_probs -= torch.log(self.action_scale * (1 - scaled_acts.pow(2)) + 1e-6)
+        return log_probs.sum(-1, keepdim=True)
 
 class Critic(nn.Module):
     def __init__(self,
@@ -408,20 +420,35 @@ class MPO_Agent():
 
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        next_action, _, _, _ = self.target_policy.get_action(obs=batch_data["next_obs"][:,-1,:])
-        next_action = next_action.squeeze(1)
-        q_target = self.aggregation_operator(state=batch_data['next_obs'][:,-1,:],
-                                             action=next_action,
-                                             critics=self.target_qs,
-                                             mode='min_subset',
-                                             subset_size=2)
+        y = self.aggregation_operator(state=batch_data['obs'][:,0,:],
+                                      action=batch_data['acts'][:,0,:],
+                                      critics=self.target_qs, mode='min_subset',
+                                      subset_size=2)
+        for k in range(self.td_horizon):
+            r_k = batch_data['r'][:,k,:]
+            term_k = batch_data['term'][:,k,:]
+            s_kp1 = batch_data['next_obs'][:,k,:]
+            a_kp1 = self.target_policy.get_action(s_kp1)
+            q_kp1 = self.aggregation_operator(state=s_kp1,
+                                                     action=a_kp1,
+                                                     critics=self.target_qs, mode='min_subset',
+                                                     subset_size=2)
+            q_k = self.aggregation_operator(state=batch_data['obs'][:,k,:],
+                                                     action=batch_data['acts'][:,k,:],
+                                                     critics=self.target_qs, mode='min_subset',
+                                                     subset_size=2)
+            delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
 
-        #temporal diff
-        y = q_target
-        for k in range(self.td_horizon-1,-1,-1):
-            termination = batch_data['term'][:,k,:]
-            reward =batch_data['r'][:,k,:]
-            y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
+            c = 1
+            if k > 0:
+                for i in range(k):
+                    logp_behavior_i = batch_data['log_probs'][:,i,:]
+                    
+        # Basic nstep bootstrapping
+        # for k in range(self.td_horizon-1,-1,-1):
+        #     termination = batch_data['term'][:,k,:]
+        #     reward =batch_data['r'][:,k,:]
+        #     y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y
 
         masks = torch.bernoulli(torch.full((self.batch_sz, self.n_critics), self.p_bootstrap, device=self.device)).bool()
         losses_this_step = []
@@ -472,6 +499,20 @@ class MPO_Agent():
             return next_q_values.median(dim=0).values
         else:
             raise ValueError(f"Unknown aggregation method: {mode}")
+        
+    def importance_sampling_coef(self,
+                                 log_pi:torch.Tensor,
+                                 log_mu: torch.Tensor,
+                                 mode:str='IS',
+                                 _lambda:float=1.0) -> torch.Tensor:
+        if mode == "IS":
+            return (log_pi-log_mu).exp()
+        elif mode == "lambda":
+            return _lambda
+        elif mode == "TB":
+            return _lambda*log_pi.exp()
+        elif mode == "retrace":
+            return (log_pi - log_mu).exp().clamp(max=1.0) * _lambda
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
