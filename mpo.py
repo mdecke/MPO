@@ -65,7 +65,7 @@ def quantile_huber_loss(td_errors: torch.Tensor, tau: torch.Tensor, kappa: float
                         kappa * (abs_err - 0.5 * kappa))
     # asymmetric quantile weight: |tau - 1(delta < 0)|
     tau_w = (tau.unsqueeze(1) - (td_errors.detach() < 0).float()).abs()  # (B, N_prime, N)
-    return (tau_w * huber/kappa).sum(dim=2).mean(dim=1).mean()
+    return (tau_w * huber/kappa).mean(dim=2).mean(dim=1).mean() #since IQN estimates both support and proba mass, avrg over each. sum along quantiles is QR-DQN style
 
 def load_config(config_dict_path:str, args) -> Dict:
     with open(config_dict_path, 'r') as file:
@@ -446,8 +446,7 @@ class MPO_Agent():
         self.policy.train()
         self.target_policy.train()
         self.q_function.train()
-        self.target_q.train()
-        
+        self.target_q.train()      
     
     def _eval(self) -> None:
         self.policy.eval()
@@ -455,29 +454,45 @@ class MPO_Agent():
         self.q_function.eval()
         self.target_q.eval()
         
-
     def update_critic(self,
                       batch_data:Dict[str,torch.Tensor]) -> None:
-        obs = batch_data['obs'][:, -1, :]
-        acts = batch_data['acts'][:, -1, :]
-        next_obs = batch_data['next_obs'][:, -1, :]
-
         with torch.no_grad():
-            next_action, _, _, _ = self.target_policy.get_action(obs=next_obs)
-            next_action = next_action.squeeze(1)
-
-            # Sample target quantile levels and get distributional targets
             tau_prime = torch.rand(self.batch_sz, self.critic_n_quantiles, device=self.device)
-            z_target = self.target_q(next_obs, next_action, tau_prime)  # (B, N_prime)
+            y = self.target_q(state=batch_data['obs'][:,0,:],
+                              action=batch_data['acts'][:,0,:],
+                              tau=tau_prime)
+            q_0 = y.clone()
+            c_prod = torch.ones((self.batch_sz,1), device=self.device)
 
-            
-            y = z_target
-            for k in range(self.td_horizon - 1, -1, -1):
-                termination = batch_data['term'][:, k, :]  # (B, 1)
-                reward = batch_data['r'][:, k, :]     # (B, 1)
-                y = reward * self.dt + (self.gamma ** self.dt) * (~termination) * y  # (B, N_prime)
+            for k in range(self.td_horizon):
+                done_k = batch_data['term'][:, k, :] | batch_data['trunc'][:, k, :] #pendulum specific - no terminations only truncations. for non episodic envs keep only terminations
+                r_k = batch_data['r'][:, k, :] 
+                s_kp1 = batch_data['next_obs'][:, k, :]
+                a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
+                a_kp1 = a_kp1.squeeze(1) # (batch, 1, act_dim) -> (batch, act_dim)
+                q_kp1 = self.target_q(s_kp1, a_kp1, tau_prime)
+
+                if k == 0:
+                    q_k = q_0
+                else:
+                    q_k = self.target_q(batch_data['obs'][:,k,:], batch_data['acts'][:,k,:], tau_prime)
+
+                delta_k = r_k + self.gamma * (~done_k)*q_kp1 - q_k
+
+                if k>0:
+                    logp_behavior_k = batch_data['log_probs'][:, k, :]
+                    logp_target_k  = self.target_policy.get_log_probs(batch_data['obs'][:, k, :],
+                                                                      batch_data['raw_acts'][:, k, :])
+                    c_k = self.importance_sampling_coef(log_pi=logp_target_k,
+                                                        log_mu=logp_behavior_k,
+                                                        mode='retrace')
+                    c_prod *= c_k
+                
+                y += (self.gamma ** k) * c_prod * delta_k
 
         # Sample current quantile levels and predict
+        obs = batch_data["obs"][:,0,:]
+        acts = batch_data['acts'][:,0,:]
         tau = torch.rand(self.batch_sz, self.critic_n_quantiles, device=self.device)
         z_pred = self.q_function(obs, acts, tau)  # (B, N)
 
@@ -498,6 +513,18 @@ class MPO_Agent():
             self.mean_q_value.append(
                 self.q_function(obs, acts, tau_diag).mean(dim=-1).mean().item()
             )
+    
+    def importance_sampling_coef(self,log_pi:torch.Tensor, log_mu:torch.Tensor, mode:str="IS", _lambda:float=1.0):
+        if mode == "IS":
+            return (log_pi-log_mu).exp()
+        elif mode == "lambda":
+            return _lambda
+        elif mode == "TB":
+            return _lambda*log_pi.exp()
+        elif mode == "retrace":
+            return (log_pi - log_mu).exp().clamp(max=1.0) * _lambda
+        else:
+            raise ValueError(f"{mode} is not a valid mode of IS")
 
     def solve_temp_dual(self, q_samples:torch.Tensor, epsilon:float, n_dual_steps:int=200) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_sz, n_samples = q_samples.shape
@@ -547,7 +574,7 @@ class MPO_Agent():
 
     def e_step(self,
                batch_data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = batch_data['obs'][:, -1, :]  # (B, obs_dim)
+        obs = batch_data['obs'][:, 0, :]  # (B, obs_dim)
 
         bounded_actions, _, _, raw_actions = self.target_policy.get_action(obs, n_samples=self.policy_samples)
 
@@ -594,8 +621,8 @@ class MPO_Agent():
         # alpha_sigma = self.solve_kl_dual(kl_sigma, self.m_step_epsilon_sigma, self.n_kl_dual_steps)
 
         # No loop needed
-        self.alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.1)
-        self.alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.1)
+        self.alpha_mu = torch.clamp(kl_mu.detach() - self.m_step_epsilon_mu, min=0.0)
+        self.alpha_sigma = torch.clamp(kl_sigma.detach() - self.m_step_epsilon_sigma, min=0.0)
 
         policy_loss = (nll
                        + self.alpha_mu    * (kl_mu    - self.m_step_epsilon_mu)
@@ -625,7 +652,7 @@ class MPO_Agent():
         # print(f"critic update duration: {time.perf_counter() - t_0_critic}")
         
         if not critic_only:
-            obs = batch['obs'][:, -1, :]
+            obs = batch['obs'][:, 0, :]
             with torch.no_grad():
                 # t_0_e_step = time.perf_counter()
                 sampled_actions, weights, _ = self.e_step(batch)
