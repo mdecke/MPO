@@ -428,9 +428,11 @@ class MPO_Agent():
                                         critics=self.target_qs, mode='min_subset',
                                         subset_size=2, subset_idx=subset_idx)
             c_prod = torch.ones((self.batch_sz, 1), device=self.device)
+            alive = torch.ones((self.batch_sz, 1), device=self.device)
+
             for k in range(self.td_horizon):
                 r_k = batch_data['r'][:,k,:]
-                term_k = batch_data['term'][:,k,:]
+                term_k = batch_data['term'][:,k,:]|batch_data['trunc'][:,k,:]
                 s_kp1 = batch_data['next_obs'][:,k,:]
                 a_kp1,_,_,_ = self.target_policy.get_action(s_kp1)
                 a_kp1 = a_kp1.squeeze(1)  # (batch, 1, act_dim) -> (batch, act_dim)
@@ -452,13 +454,15 @@ class MPO_Agent():
                 delta_k = r_k + self.gamma * (~term_k)*q_kp1 - q_k
 
                 if k > 0:
+                    alive *= ~prev_done
                     logp_behavior_k = batch_data['log_probs'][:, k, :]
                     logp_target_k  = self.target_policy.get_log_probs(batch_data['obs'][:, k, :],
                                                                       batch_data['raw_acts'][:, k, :])
                     c_k = self.importance_sampling_coef(logp_target_k, logp_behavior_k, mode='retrace')
                     c_prod *= c_k
                 
-                y += (self.gamma ** k) * c_prod * delta_k
+                y += (self.gamma ** k) * c_prod * alive * delta_k
+                prev_done = term_k
                     
         # Basic nstep bootstrapping
         # for k in range(self.td_horizon-1,-1,-1):
@@ -732,17 +736,9 @@ class MPO_Agent():
                 for _ in range(self.utd_ratio):
                     self.update(critic_only)
 
-            # current_interaction = step * self.n_envs
-            # if current_interaction % self.save_checkpoint_rate == 0:
-            #     self.save_checkpoint(current_interaction, checkpoints_folder)
-
-            next_checkpoint_at = self.save_checkpoint_rate
             current_interaction = (step + 1) * self.n_envs
-            if current_interaction >= next_checkpoint_at:
+            if current_interaction % self.save_checkpoint_rate == 0:
                 self.save_checkpoint(current_interaction, checkpoints_folder)
-                # advance to the next multiple of save_checkpoint_rate beyond current_interaction
-                next_checkpoint_at = ((current_interaction // self.save_checkpoint_rate) + 1) \
-                                    * self.save_checkpoint_rate
 
         envs.close()
         csv_path = os.path.join(experiment_folder, "performance.csv")
