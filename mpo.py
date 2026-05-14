@@ -463,6 +463,7 @@ class MPO_Agent():
                               tau=tau_prime)
             q_0 = y.clone()
             c_prod = torch.ones((self.batch_sz,1), device=self.device)
+            alive = torch.ones((self.batch_sz, 1), device=self.device)
 
             for k in range(self.td_horizon):
                 done_k = batch_data['term'][:, k, :] | batch_data['trunc'][:, k, :] #pendulum specific - no terminations only truncations. for non episodic envs keep only terminations
@@ -480,6 +481,7 @@ class MPO_Agent():
                 delta_k = r_k + self.gamma * (~done_k)*q_kp1 - q_k
 
                 if k>0:
+                    alive =~prev_done
                     logp_behavior_k = batch_data['log_probs'][:, k, :]
                     logp_target_k  = self.target_policy.get_log_probs(batch_data['obs'][:, k, :],
                                                                       batch_data['raw_acts'][:, k, :])
@@ -488,7 +490,8 @@ class MPO_Agent():
                                                         mode='retrace')
                     c_prod *= c_k
                 
-                y += (self.gamma ** k) * c_prod * delta_k
+                y += (self.gamma ** k) * c_prod * alive * delta_k
+                prev_done = done_k
 
         # Sample current quantile levels and predict
         obs = batch_data["obs"][:,0,:]
