@@ -2,6 +2,7 @@ environment:
   seed : 42
   device : cpu
   reward_scale : 10
+  dt : 1.0
 
 agent :
   policy :
@@ -10,7 +11,6 @@ agent :
     act_fct : 'relu'
     layer_norm : true
     gradient_clip : 5.0
-    update_delay : 0.1
 
   critic :
     hidden_layers : [128, 64, 64]
